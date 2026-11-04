@@ -12,15 +12,30 @@ isdefined(TumourPKPD, :fit_drug) ||
     Base.include(TumourPKPD, joinpath(@__DIR__, "..", "src", "hierarchical.jl"))
 const H = TumourPKPD
 
-N          = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 20
-nchains    = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2
-nsamples   = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 300
-nadapt     = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 300
-latent_w0  = length(ARGS) >= 5 ? parse(Bool, ARGS[5]) : false
-seed       = length(ARGS) >= 6 ? parse(Int, ARGS[6]) : 20261104
-tag        = length(ARGS) >= 7 ? ARGS[7] : "N$(N)"
+# flush stdout once a second so a redirected log shows progress (and survives a kill)
+const _flusher = Timer(_ -> flush(stdout), 1.0; interval = 1.0)
 
-println("# synthetic recovery  N=$N chains=$nchains samples=$nsamples adapt=$nadapt latent_w0=$latent_w0 seed=$seed threads=$(Threads.nthreads())")
+include(joinpath(@__DIR__, "procchains.jl"))
+const FLAGS = filter(a -> startswith(a, "--"), ARGS)
+const POS = filter(a -> !startswith(a, "--"), ARGS)
+const CHILD = let f = filter(a -> startswith(a, "--chain-only="), FLAGS); isempty(f) ? 0 : parse(Int, split(f[1], '=')[2]) end
+const CHILD_OUT = let f = filter(a -> startswith(a, "--chain-out="), FLAGS); isempty(f) ? "" : split(f[1], '=')[2] end
+const NOPROCS = "--noprocs" in FLAGS
+ARGS_ = POS
+
+N          = length(POS) >= 1 ? parse(Int, POS[1]) : 20
+nchains    = length(POS) >= 2 ? parse(Int, POS[2]) : 2
+nsamples   = length(POS) >= 3 ? parse(Int, POS[3]) : 300
+nadapt     = length(POS) >= 4 ? parse(Int, POS[4]) : 300
+latent_w0  = length(POS) >= 5 ? parse(Bool, POS[5]) : true
+seed       = length(POS) >= 6 ? parse(Int, POS[6]) : 20261104
+tag        = length(POS) >= 7 ? POS[7] : "N$(N)"
+# optional tighter prior on logλ1 sd (default 0.9, see HierPriors)
+l1sd       = length(POS) >= 8 ? parse(Float64, POS[8]) : 0.9
+l1mu       = length(POS) >= 9 ? parse(Float64, POS[9]) : log(300.0)
+PRIORS     = H.HierPriors(; logλ1 = (l1mu, l1sd))
+
+CHILD > 0 || println("# synthetic recovery  logλ1 prior N($(round(l1mu; digits=3)), $(l1sd))  N=$N chains=$nchains samples=$nsamples adapt=$nadapt latent_w0=$latent_w0 seed=$seed threads=$(Threads.nthreads())")
 
 # --- truth ---------------------------------------------------------------------------------
 # mouse-like PK in per-day units: k = CL/V = 2/day (t1/2 ≈ 8 h), fast absorption; daily oral dosing 28 days.
@@ -35,9 +50,17 @@ units, tru = H.simulate_units(rng, N, doses, pk, cref; truth)
 nobs = sum(length(u.control.t) + length(u.treated.t) - 2 for u in units)
 nzero = sum(count(==(0.0), u.treated.v) + count(==(0.0), u.control.v) for u in units)
 nzero_units = count(u -> any(==(0.0), u.treated.v), units)
-println("units=$N  post-baseline obs=$nobs  zero (censored) obs=$nzero in $nzero_units units")
-println("final control volume (median, max): ",
+CHILD > 0 || println("units=$N  post-baseline obs=$nobs  zero (censored) obs=$nzero in $nzero_units units")
+CHILD > 0 || println("final control volume (median, max): ",
         round(median(last(u.control.v) for u in units); digits = 0), " ", round(maximum(last(u.control.v) for u in units); digits = 0))
+
+if CHILD > 0                                      # child process: sample one chain, save, exit
+    chain, _ = H.fit_drug(units, doses, pk, cref; nchains = 1, nsamples, nadapt, chain_only = true,
+                          rng = MersenneTwister(1000 * seed + CHILD), latent_w0, priors = PRIORS, log_every = 250)
+    save_chain_parts(CHILD_OUT, chain)
+    println("[chain $CHILD] saved"); flush(stdout)
+    exit(0)
+end
 
 # --- gradient timing ---------------------------------------------------------------------------
 using Turing
@@ -45,9 +68,9 @@ const DynamicPPL = Turing.DynamicPPL
 const LogDensityProblems = Turing.LogDensityProblems
 function grad_timing(local_grad, threaded; reps = 20)
     d = H.prepare_data(units, doses, pk, cref; local_grad, threaded, latent_w0)
-    model = H.hier_model(d, H.default_priors())
+    model = H.hier_model(d, PRIORS)
     D = 7 + 2N + (latent_w0 ? 2N : 0)
-    adt = AutoForwardDiff(chunksize = local_grad ? D : 12)
+    adt = AutoForwardDiff(chunksize = min(D, local_grad ? 32 : 12))   # bounded chunk policy (as fit_drug)
     vi = DynamicPPL.VarInfo(MersenneTwister(1), model)
     nt0 = merge(H.initial_values(d, H.default_priors(), MersenneTwister(2)), (; μ_k2 = log(0.4), σ = 0.2))
     vi = DynamicPPL.link(DynamicPPL.initialize_parameters!!(vi, nt0, model), model)
@@ -70,17 +93,24 @@ end
 
 # --- fit -------------------------------------------------------------------------------------
 println("\n## fit")
-chain, pd = H.fit_drug(units, doses, pk, cref; drug = "synthetic_$(tag)", nchains, nsamples, nadapt,
-                       rng = MersenneTwister(seed + 1), latent_w0, progress = false)
+fitkw = (; drug = "synthetic_$(tag)", nsamples, nadapt, latent_w0, progress = false, priors = PRIORS, seed)
+if nchains > 1 && Threads.nthreads() > 1 && !NOPROCS
+    println("sampling $nchains chains in separate processes (max $(Threads.nthreads()) at a time)")
+    chain_, wall = run_chain_procs(@__FILE__, POS, nchains; maxprocs = Threads.nthreads(), project = Base.active_project())
+    chain, pd = H.fit_drug(units, doses, pk, cref; fitkw..., precomputed_chain = chain_, precomputed_runtime = wall)
+else
+    chain, pd = H.fit_drug(units, doses, pk, cref; fitkw..., nchains, rng = MersenneTwister(seed + 1), log_every = 200)
+end
 diag = pd.diagnostics
 niter = nchains * (nsamples + nadapt)
 @printf("runtime %.1f s  (%d iterations total -> %.1f s per 100 iterations)\n",
         diag["runtime_s"], niter, 100 * diag["runtime_s"] / niter)
+println("parallel mode: ", diag["settings"]["parallel"], "  chunksize ", diag["settings"]["chunksize"])
 for k in ("max_rhat", "min_ess_bulk", "n_divergences", "mean_acceptance", "mean_tree_depth",
           "max_tree_depth_hits", "mean_step_size")
     println(rpad(k, 22), diag[k])
 end
-H.save_fit(joinpath(homedir(), "Work/tumour-pkpd/logs/2026-11-04-inference-synth-$(tag).jld2"), pd)
+H.save_fit(joinpath(homedir(), "Work/tumour-pkpd/logs/2026-11-04-p2-inference-synth-$(tag).jld2"), pd)
 
 # --- recovery table ----------------------------------------------------------------------------
 q(x) = (quantile(x, 0.05), median(x), quantile(x, 0.95))
@@ -106,6 +136,12 @@ for (nm, post, tv) in (("λ0", pd.λ0, tru.λ0), ("k2", pd.k2, tru.k2))
     @printf("%s: 90%% coverage %.2f (%d/%d), 50%% coverage %.2f, median |log error| of posterior median %.3f\n",
             nm, cov, round(Int, cov * N), N, lcov50, relerr)
 end
+if latent_w0
+    for (nm, post, tv) in (("w0 control", pd.w0_control_draws, tru.w0c), ("w0 treated", pd.w0_treated_draws, tru.w0t))
+        cov = mean(quantile(post[:, i], 0.05) <= tv[i] <= quantile(post[:, i], 0.95) for i in 1:N)
+        @printf("%s: 90%% coverage %.2f\n", nm, cov)
+    end
+end
 # k2 for censored/strong responders vs others
 resp = [any(==(0.0), u.treated.v) for u in units]
 if any(resp) && !all(resp)
@@ -118,5 +154,5 @@ end
 # --- pointwise log-lik timing -------------------------------------------------------------------
 println("\n## pointwise_loglik")
 t0 = time()
-ll = H.pointwise_loglik(pd, units; draws = 1:min(200, length(pd.σ)))
+ll = H.pointwise_loglik(pd, units; draws = 1:min(200, length(pd.σ)))   # uses each draw's latent baselines
 @printf("pointwise_loglik 200 draws x %d obs: %.2f s, finite: %s\n", size(ll, 2), time() - t0, all(isfinite, ll))

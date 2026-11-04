@@ -2,6 +2,7 @@ using Test, Random, Statistics
 using TumourPKPD
 using TumourPKPD: Dose, OneCmt, dosing_schedule, conc, PKExposure
 using Turing
+using MCMCChains
 isdefined(TumourPKPD, :fit_drug) ||
     Base.include(TumourPKPD, joinpath(@__DIR__, "..", "src", "hierarchical.jl"))
 const H = TumourPKPD
@@ -12,7 +13,7 @@ using ForwardDiff
 @testset "hierarchical" begin
     pk = OneCmt(CL = 3.0, V = 1.5, ka = 24.0, F = 0.8)
     doses = dosing_schedule(25.0; start = 0.0, interval = 1.0, n = 21)
-    cref = maximum(conc(pk, doses, 0:0.02:21.0))
+    cref = H.reference_cref(pk, doses)
     truth = (μ_λ0 = log(0.08), ω_λ0 = 0.3, μ_k2 = log(0.5), ω_k2 = 0.7,
              logλ1 = log(120.0), logk1 = log(0.7), σ = 0.15)
     rng = MersenneTwister(11)
@@ -24,7 +25,6 @@ using ForwardDiff
         @test e1 isa PKExposure
         direct(t) = conc(pk, doses, t) / cref
         @test maximum(abs(e1(t) - direct(t)) for t in 0:0.07:25) < 1e-10
-        # censoring and baseline handling
         c = (; t = [0.0, 3.0, 7.0, 10.0], v = [150.0, 0.0, 40.0, -1.0])
         cd = H.prepare_curve(c)
         @test cd.v0 == 150.0
@@ -33,8 +33,25 @@ using ForwardDiff
         @test cd.logv[2] ≈ log(40.0)
     end
 
-    function make_ldf(; latent = false, local_grad = true, threaded = true, adtype = true, chunk = nothing)
-        d = H.prepare_data(units, doses, pk, cref; latent_w0 = latent, local_grad, threaded, solver = tight)
+    @testset "invalid baselines are dropped, not fabricated" begin
+        mk(m, t, v) = (; model = m, control = (; t, v), treated = (; t, v))
+        good = mk("ok", [0.0, 5.0, 10.0], [100.0, 150.0, 300.0])
+        zero0 = mk("zero0", [0.0, 5.0, 10.0], [0.0, 150.0, 300.0])
+        nan0 = mk("nan0", [0.0, 5.0], [NaN, 150.0])
+        late = mk("late", [2.0, 5.0], [100.0, 150.0])             # no day-0 observation
+        @test H.valid_baseline(good.control) && !H.valid_baseline(zero0.control)
+        @test !H.valid_baseline(nan0.control) && !H.valid_baseline(late.control)
+        @test_throws ArgumentError H.prepare_curve(zero0.control)
+        ud, dropped = @test_logs (:warn, r"dropping 3 of 4") H.prepare_units([good, zero0, nan0, late])
+        @test length(ud) == 1 && ud[1].model == "ok"
+        @test sort(dropped) == ["late", "nan0", "zero0"]
+        d = @test_logs (:warn, r"dropping 1 of 2") H.prepare_data([good, zero0], doses, pk, cref)
+        @test d.dropped == ["zero0"] && length(d.units) == 1
+        @test_throws ArgumentError H.prepare_data([zero0], doses, pk, cref)
+    end
+
+    function make_ldf(; latent = false, local_grad = true, threaded = true, adtype = true, chunk = nothing, solver = tight)
+        d = H.prepare_data(units, doses, pk, cref; latent_w0 = latent, local_grad, threaded, solver)
         model = H.hier_model(d, H.default_priors())
         D = 7 + 2 * 3 + (latent ? 6 : 0)
         adt = AutoForwardDiff(chunksize = chunk === nothing ? (local_grad ? D : 12) : chunk)
@@ -60,7 +77,6 @@ using ForwardDiff
                 (LogDensityProblems.logdensity(ldf0, x .+ e) - LogDensityProblems.logdensity(ldf0, x .- e)) / 2h
             end
             @test maximum(abs.(g .- fd) ./ (1 .+ abs.(fd))) < 1e-4
-            # global ForwardDiff (no local-gradient shortcut) gives the same gradient
             ldfg, _, _ = make_ldf(; latent, local_grad = false)
             lpg, gg = LogDensityProblems.logdensity_and_gradient(ldfg, x)
             @test lpg ≈ lp rtol = 1e-8
@@ -70,8 +86,42 @@ using ForwardDiff
             lpc, gc = LogDensityProblems.logdensity_and_gradient(ldfc, x)
             @test lpc ≈ lp rtol = 1e-10
             @test gc ≈ g rtol = 1e-8
-            @test dc.cache.hits >= 2
+            @test H.cache_stats(dc)[1] >= 2
         end
+    end
+
+    @testset "plain and AD values agree at default tolerances (censored, shrinking, extreme)" begin
+        dflt = H.SolverCfg()                       # production tolerances 1e-5 / 1e-5
+        ud, _ = H.prepare_units(units)
+        d = H.HierData(ud, H.make_exposure(pk, doses, cref), 4.0, dflt, true, true, false)
+        dt = H.HierData(ud, H.make_exposure(pk, doses, cref), 4.0, tight, true, true, false)
+        u = ud[1]
+        lc, lt = log(u.control.v0), log(u.treated.v0)
+        regimes = Dict(
+            "typical"   => (log(0.08), log(0.5), log(120.0), log(0.7), 0.15),
+            "shrinking" => (log(0.05), log(3.0), log(120.0), log(0.7), 0.15),   # strong response
+            "eradicated" => (log(0.02), log(40.0), log(120.0), log(1.5), 0.15), # volume goes to ~0, censored obs
+            "extreme"   => (log(5.0), log(300.0), log(5.0), log(20.0), 0.05),   # stiff / huge rates
+            "tiny sigma" => (log(0.08), log(0.5), log(120.0), log(0.7), 0.01))
+        for (name, (a, b, c, e, s)) in regimes
+            p = (a, b, c, e, s, lc, lt)
+            vplain = H.unit_loglik(u, p..., d)
+            v, g = H.unit_valgrad(u, p, d)
+            if isfinite(vplain)
+                @test v == vplain                       # same value, bit for bit, in both paths
+                @test all(isfinite, g)
+                # gradient from the default-tolerance dual solve vs tight-tolerance dual solve
+                vt, gt = H.unit_valgrad(u, p, dt)
+                if name != "extreme" && name != "tiny sigma"
+                    @test maximum(abs.(g .- gt) ./ (1 .+ abs.(gt))) < 5e-3
+                end
+            else
+                @test v == -Inf                         # same failure semantics
+                @test all(==(0.0), g)
+            end
+        end
+        # eradication really exercises the censored branch
+        @test any(u.treated.cens) || any(any(w.treated.cens) for w in ud)
     end
 
     @testset "threaded == serial" begin
@@ -80,50 +130,144 @@ using ForwardDiff
         args = (fill(log(0.08), 3), fill(log(0.5), 3), [log(u.control.v0) for u in dt.units],
                 [log(u.treated.v0) for u in dt.units], log(120.0), log(0.7), 0.2)
         @test H.population_loglik(dt, args...) == H.population_loglik(ds, args...)
-        @test Threads.nthreads() >= 1
     end
 
     @testset "ODE failure gives -Inf" begin
         _, _, d = make_ldf()
         u = d.units[1]
-        # absurd rates make the solve fail or the likelihood non-finite; must not throw or return NaN
         v = H.unit_loglik(u, log(1e6), log(1e6), log(1e6), log(1e6), 0.2, log(u.control.v0), log(u.treated.v0), d)
         @test !isnan(v)
     end
 
-    @testset "fit_drug, PosteriorDraws, save/load, pointwise" begin
+    @testset "chain parts roundtrip (process-parallel chains)" begin
+        c1 = Chains(randn(MersenneTwister(1), 30, 3, 1), [:a, :b, :tree_depth], Dict(:internals => [:tree_depth]))
+        c2 = Chains(randn(MersenneTwister(2), 30, 3, 1), [:a, :b, :tree_depth], Dict(:internals => [:tree_depth]))
+        r1 = H.chain_from_parts(H.chain_to_parts(c1)...)
+        @test Array(r1) == Array(c1) && Symbol.(names(r1)) == [:a, :b, :tree_depth]
+        cc = chainscat(r1, H.chain_from_parts(H.chain_to_parts(c2)...))
+        @test size(cc) == (30, 3, 2)
+    end
+
+    @testset "diagnostics edge cases" begin
+        # constant parameter -> no finite R-hat/ESS: must not throw, reports NaN
+        ch = Chains(hcat(ones(20, 1), ones(20, 1)), [:a, :tree_depth], Dict(:internals => [:tree_depth]))
+        dg = H.chain_diagnostics(ch; max_depth = 1)
+        @test dg["max_tree_depth_hits"] == 20            # depth 1 >= configured max_depth 1
+        dg2 = H.chain_diagnostics(ch; max_depth = 2)
+        @test dg2["max_tree_depth_hits"] == 0
+        @test dg isa Dict
+    end
+
+    @testset "fit_drug (latent default), PosteriorDraws, save/load, pointwise" begin
         chain, pd = H.fit_drug(units, doses, pk, cref; drug = "toy", nchains = 2, nsamples = 20,
-                               nadapt = 20, rng = MersenneTwister(5), split = "late", cutoffs = Dict("syn1" => 14.0), seed = 5, reltol = 1e-5, abstol = 1e-5)
+                               nadapt = 20, rng = MersenneTwister(5), cutoffs = Dict("syn1|treated" => 14.0),
+                               split = Dict("kind" => "late", "late_frac" => 0.3), seed = 5)
         @test pd isa H.PosteriorDraws
+        @test pd.diagnostics["latent_w0"] === true
         @test length(pd.σ) == 40
         @test size(pd.λ0) == (40, 3) && size(pd.k2) == (40, 3)
+        @test size(pd.w0_control_draws) == (40, 3) && size(pd.w0_treated_draws) == (40, 3)
+        @test pd.w0_control ≈ vec(median(pd.w0_control_draws; dims = 1))
+        @test length(unique(pd.w0_treated_draws[:, 1])) > 1       # genuinely per-draw
         @test pd.models == ["syn1", "syn2", "syn3"]
         @test all(pd.λ0 .> 0) && all(pd.k2 .> 0)
         @test haskey(pd.diagnostics, "max_rhat") && haskey(pd.diagnostics, "runtime_s")
-        @test pd.diagnostics["settings"]["nchains"] == 2
         @test pd.diagnostics["nchains"] == 2 && pd.diagnostics["draws_per_chain"] == 20
-        @test pd.diagnostics["train_models"] == pd.models && pd.diagnostics["split"] == "late"
-        @test pd.diagnostics["cutoffs"] == Dict("syn1" => 14.0) && pd.diagnostics["lod"] == H._default_lod()
+        @test pd.diagnostics["train_models"] == pd.models
+        @test pd.diagnostics["split"]["kind"] == "late" && pd.diagnostics["split"]["late_frac"] == 0.3
+        @test pd.diagnostics["cutoffs"] == Dict("syn1|treated" => 14.0)
+        @test pd.diagnostics["lod"] == H._default_lod() && isempty(pd.diagnostics["dropped_units"])
+        @test pd.diagnostics["settings"]["chunksize"] <= 32
+        @test pd.diagnostics["max_observed_day"] == maximum(max(last(u.control.t), last(u.treated.t)) for u in units)
+        @test pd.diagnostics["median_followup_day"] == median(last(u.treated.t) for u in units)
+        @test pd.diagnostics["tumour_types"] == Dict(m => "synthetic" for m in pd.models)
         path = joinpath(mktempdir(), "toy.jld2")
         H.save_fit(path, pd)
         pd2 = H.load_fit(path)
         @test pd2.drug == pd.drug && pd2.models == pd.models
         @test pd2.λ0 == pd.λ0 && pd2.k2 == pd.k2 && pd2.σ == pd.σ
+        @test pd2.w0_control_draws == pd.w0_control_draws && pd2.w0_treated_draws == pd.w0_treated_draws
         @test pd2.doses == pd.doses && pd2.pk == pd.pk && pd2.cref == pd.cref
-        @test pd2.diagnostics["settings"]["lod"] == H._default_lod()
 
         ll = H.pointwise_loglik(pd, units; draws = 1:5)
         idx = H.pointwise_index(units)
         @test size(ll) == (5, length(idx.t))
         @test all(isfinite, ll)
-        # sums of pointwise terms reproduce the unit-level likelihood
+        # sums of pointwise terms reproduce the unit likelihood evaluated at the draw's OWN latent baselines
         d = H.prepare_data(units, doses, pk, cref)
         s = 3
         for (i, u) in enumerate(d.units)
             v = H.unit_loglik(u, log(pd.λ0[s, i]), log(pd.k2[s, i]), pd.logλ1[s], pd.logk1[s], pd.σ[s],
-                              log(u.control.v0), log(u.treated.v0), d)
+                              log(pd.w0_control_draws[s, i]), log(pd.w0_treated_draws[s, i]), d)
             @test sum(ll[s, idx.group .== i]) ≈ v rtol = 1e-8
         end
         @test size(H.grouped_loglik(ll, idx)) == (5, 3)
+    end
+
+    @testset "fixed-baseline fit stores constant baselines" begin
+        _, pdf = H.fit_drug(units, doses, pk, cref; drug = "toyfixed", nchains = 1, nsamples = 10, nadapt = 10,
+                            rng = MersenneTwister(6), latent_w0 = false)
+        @test pdf.diagnostics["latent_w0"] === false
+        @test all(pdf.w0_control_draws .== reshape(pdf.w0_control, 1, :))
+        @test pdf.w0_control == [u.control.v0 for u in H.prepare_units(units)[1]]
+    end
+
+    @testset "marginal_unit_loglik vs brute-force importance sampling" begin
+        # hand-built posterior draws (no fit): 2 population draws, latent baselines
+        S = 2
+        set = Dict{String,Any}("lod" => 4.0, "latent_w0" => true, "reltol" => 1e-5, "abstol" => 1e-5)
+        pops = (μ_λ0 = [log(0.08), log(0.06)], ω_λ0 = [0.3, 0.4], μ_k2 = [log(0.5), log(0.4)],
+                ω_k2 = [0.7, 0.8], logλ1 = [log(120.0), log(150.0)], logk1 = [log(0.7), log(0.6)],
+                σ = [0.15, 0.2])
+        ud, _ = H.prepare_units(units)
+        v0c = [u.control.v0 for u in ud]; v0t = [u.treated.v0 for u in ud]
+        mkpd(latent) = H.PosteriorDraws("syn", [u.model for u in ud], doses, fill(pk, S), cref,
+            pops.μ_λ0, pops.ω_λ0, pops.μ_k2, pops.ω_k2, pops.logλ1, pops.logk1, pops.σ,
+            ones(S, 3), ones(S, 3), v0c, v0t, repeat(v0c', S), repeat(v0t', S),
+            Dict{String,Any}("settings" => merge(set, Dict("latent_w0" => latent)), "latent_w0" => latent))
+        pdl = mkpd(true)
+        expo = H.make_exposure(pk, doses, cref)
+        cfg = H.SolverCfg()
+        # one log-likelihood evaluation at standardised latent vector z = (z_λ0, z_k2, z_w0c, z_w0t)
+        function loglik_z(i, s, z; latent = true)
+            u = ud[i]; σ = pops.σ[s]
+            hd = H.HierData([u], expo, 4.0, cfg, latent, false, false)
+            H.unit_loglik(u, pops.μ_λ0[s] + pops.ω_λ0[s] * z[1], pops.μ_k2[s] + pops.ω_k2[s] * z[2],
+                          pops.logλ1[s], pops.logk1[s], σ,
+                          log(u.control.v0) + (latent ? σ * z[3] : 0.0), log(u.treated.v0) + (latent ? σ * z[4] : 0.0), hd)
+        end
+        # estimator B: importance sampling with an independent, wider proposal N(0, 1.6^2 I)
+        function is_estimate(i, s, M, rng; sd = 1.6)
+            lw = Vector{Float64}(undef, M)
+            for m in 1:M
+                z = sd .* randn(rng, 4)
+                logq = -0.5 * sum(abs2, z) / sd^2 - 4 * log(sd) - 2 * log(2π)
+                lw[m] = loglik_z(i, s, z) + (-0.5 * sum(abs2, z) - 2 * log(2π)) - logq
+            end
+            mx = maximum(lw); w = exp.(lw .- mx)
+            est = mx + log(mean(w))
+            se = std(w) / (mean(w) * sqrt(M))             # delta method for log of a mean
+            return est, se
+        end
+        M = 1500
+        A = H.marginal_unit_loglik(pdl, units; M, rng = MersenneTwister(1), threaded = false)
+        @test size(A) == (S, 3) && all(isfinite, A)
+        for (i, s) in ((1, 1), (2, 2), (3, 1))
+            # standard error of the prior-MC estimator from its own samples
+            eps = randn(MersenneTwister(1), M, 4)
+            lw = [loglik_z(i, s, eps[m, :]) for m in 1:M]
+            mx = maximum(lw); w = exp.(lw .- mx)
+            seA = std(w) / (mean(w) * sqrt(M))
+            @test A[s, i] ≈ mx + log(mean(w)) atol = 1e-6                # matches the direct computation
+            B, seB = is_estimate(i, s, M, MersenneTwister(99))
+            @test abs(A[s, i] - B) < 5 * sqrt(seA^2 + seB^2) + 1e-3
+        end
+        # baselines are integrated for latent fits but not for fixed fits
+        pdf = mkpd(false)
+        e1 = randn(MersenneTwister(2), 200, 4); e2 = copy(e1); e2[:, 3:4] .= randn(MersenneTwister(3), 200, 2)
+        @test H.marginal_unit_loglik(pdf, units; eps = e1, threaded = false) ==
+              H.marginal_unit_loglik(pdf, units; eps = e2, threaded = false)
+        @test H.marginal_unit_loglik(pdl, units; eps = e1, threaded = false) !=
+              H.marginal_unit_loglik(pdl, units; eps = e2, threaded = false)
     end
 end

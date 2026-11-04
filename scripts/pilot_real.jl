@@ -7,6 +7,8 @@ isdefined(TumourPKPD, :fit_drug) ||
     Base.include(TumourPKPD, joinpath(@__DIR__, "..", "src", "hierarchical.jl"))
 const H = TumourPKPD
 
+const _flusher = Timer(_ -> flush(stdout), 1.0; interval = 1.0)
+
 drug     = length(ARGS) >= 1 ? ARGS[1] : "binimetinib"
 nunits   = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 30
 nchains  = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 2
@@ -29,7 +31,7 @@ println("post-baseline obs=$nobs  zero obs=$nz  max curve length (days)=",
         maximum(max(last(u.control.t), last(u.treated.t)) for u in units))
 
 chain, pd = H.fit_drug(units, doses, pk, cref; drug, nchains, nsamples, nadapt,
-                       rng = MersenneTwister(seed + 100), progress = false, latent_w0 = latent, seed)
+                       rng = MersenneTwister(seed + 100), progress = false, latent_w0 = latent, seed, log_every = 100)
 dg = pd.diagnostics
 niter = nchains * (nsamples + nadapt)
 @printf("runtime %.1f s (%d iterations -> %.1f s per 100 iterations)\n", dg["runtime_s"], niter, 100 * dg["runtime_s"] / niter)
@@ -43,4 +45,4 @@ for (nm, x) in (("μ_λ0", pd.μ_λ0), ("ω_λ0", pd.ω_λ0), ("μ_k2", pd.μ_k2
     lo, md, hi = q(x)
     @printf("%-7s %8.3f  [%8.3f, %8.3f]\n", nm, md, lo, hi)
 end
-H.save_fit(joinpath(homedir(), "Work/tumour-pkpd/logs/2026-11-04-inference-pilot-$(drug)-$(length(units)).jld2"), pd)
+H.save_fit(joinpath(homedir(), "Work/tumour-pkpd/logs/2026-11-04-p2-inference-pilot-$(drug)-$(length(units)).jld2"), pd)
