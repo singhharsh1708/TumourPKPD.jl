@@ -3,3 +3,5 @@ fits/*.jld2
 !fits/README.md
 .DS_Store
 /Manifest.toml.bak
+stage/
+docs/local/

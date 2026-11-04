@@ -239,6 +239,13 @@ end
 _val_lognormpdf(x, μ, σ) = -0.5 * ((x - μ) / σ)^2 - log(σ) - 0.5 * log(2π)
 _val_lognormcdf(x, μ, σ) = log(max(0.5 * erfc_(-(x - μ) / (σ * sqrt(2))), floatmin(Float64)))
 
+# Observation-model densities on the log scale: Normal (`d === nothing`) or Student-t (`d::TDist`), scale σ.
+_val_obsdist(ν::Real) = isinf(ν) ? nothing : TDist(float(ν))
+_val_logpdf(x, μ, σ, ::Nothing) = _val_lognormpdf(x, μ, σ)
+_val_logpdf(x, μ, σ, d::TDist) = logpdf(d, (x - μ) / σ) - log(σ)
+_val_logcdf(x, μ, σ, ::Nothing) = _val_lognormcdf(x, μ, σ)
+_val_logcdf(x, μ, σ, d::TDist) = max(logcdf(d, (x - μ) / σ), log(floatmin(Float64)))
+
 # erfc without a SpecialFunctions dependency (Numerical Recipes erfc Chebyshev, rel. err < 1.2e-7;
 # adequate for censored-likelihood scoring).
 function erfc_(x)
@@ -251,10 +258,12 @@ function erfc_(x)
 end
 
 """
-    log_predictive_density(yobs, latent, σ; limit=nothing, jacobian=true) -> Vector
+    log_predictive_density(yobs, latent, σ; limit=nothing, jacobian=true, nu=5.0) -> Vector
 
-Pointwise log predictive density of observations under the lognormal observation model
-`log y ~ N(log w, σ)`, mixed over posterior draws: `log mean_s N(log y_j | log w_sj, σ_s)`.
+Pointwise log predictive density of observations under the fitted observation model
+`log y = log w + σ ε`, `ε ~ Student-t(nu)` (`nu = nu_from_fit(pd)`; `nu = Inf` is the Normal special case),
+mixed over posterior draws: `log mean_s p(log y_j | log w_sj, σ_s)`. Left-censored observations use the
+matching CDF.
 `latent` is `ndraw × n` noise-free trajectories (`simulate_regimen(...; obs_noise=false,
 details=true).y`), `σ` the matching per-draw σ. `jacobian=true` subtracts `log y` so the
 value is a density on the volume scale (comparable across transforms). Observations
@@ -264,8 +273,9 @@ density but stay in the denominator, and an observation with no valid draw score
 `-Inf` values are kept (count them with `count(==(-Inf), lpd)`), never dropped.
 """
 function log_predictive_density(yobs::AbstractVector, latent::AbstractMatrix, σ::AbstractVector;
-                                limit = nothing, jacobian::Bool = true)
+                                limit = nothing, jacobian::Bool = true, nu::Real = 5.0)
     size(latent, 1) == length(σ) || throw(DimensionMismatch("σ must have one entry per draw"))
+    dist = _val_obsdist(nu)
     S = size(latent, 1)
     out = Vector{Float64}(undef, length(yobs))
     for j in eachindex(yobs)
@@ -276,13 +286,13 @@ function log_predictive_density(yobs::AbstractVector, latent::AbstractMatrix, σ
             if limit === nothing
                 out[j] = NaN
             else
-                lw = [_val_lognormcdf(log(limit), log(latent[s, j]), σ[s]) for s in 1:S
+                lw = [_val_logcdf(log(limit), log(latent[s, j]), σ[s], dist) for s in 1:S
                       if isfinite(latent[s, j]) && latent[s, j] > 0]
                 out[j] = _val_logmeanexp(lw, S)
             end
         else
             ly = log(y)
-            lw = [_val_lognormpdf(ly, log(latent[s, j]), σ[s]) for s in 1:S
+            lw = [_val_logpdf(ly, log(latent[s, j]), σ[s], dist) for s in 1:S
                   if isfinite(latent[s, j]) && latent[s, j] > 0]
             out[j] = _val_logmeanexp(lw, S) - (jacobian ? ly : 0.0)
         end
@@ -407,6 +417,116 @@ function detection_limit_from_fit(pd)
     v = _fit_meta(pd, "lod", nothing)
     v !== nothing && return float(v)
     return isdefined(@__MODULE__, :detection_limit) ? float(detection_limit()) : 4.0
+end
+
+"""
+    nu_from_fit(pd) -> Float64
+
+Degrees of freedom of the fitted Student-t observation model (`diagnostics["nu"]`, else 5; `Inf` = Normal).
+"""
+nu_from_fit(pd) = float(_fit_meta(pd, "nu", 5.0))
+
+"Fixed sd of the latent log baselines (`diagnostics[\"baseline_sd\"]`, else 0.1)."
+baseline_sd_from_fit(pd) = float(_fit_meta(pd, "baseline_sd", 0.1))
+
+"""
+    convergence_summary(pd) -> NamedTuple
+
+Sampler diagnostics of a fit for the validation report: what the fit recorded (`max_rhat`, `min_ess_bulk`,
+`min_ess_tail`, `n_divergences`, E-BFMI, tree-depth cap hits, mean acceptance / tree depth / step size /
+leapfrog steps, the cross-mode R-hat, MAP log-densities, chains and draws per chain; `nothing` when the
+fit did not record an item) and a recomputation from the stored draws of the seven hyperparameters
+(`μ_λ0, ω_λ0, μ_k2, ω_k2, logλ1, logk1, σ`) using the saved chain layout (`recomputed`: names, rhat,
+ess_bulk, ess_tail; `nothing` if the draw count does not match `nchains`). Draws are stored chain after
+chain. Keys read: `nchains`, `draws_per_chain`, `max_rhat`, `min_ess_bulk`, `min_ess_tail`, `n_divergences`,
+`min_ebfmi`/`ebfmi`, `max_tree_depth_hits`, `mean_tree_depth`, `mean_acceptance`, `mean_step_size`,
+`mean_n_steps`, `cross_mode_rhat`/`rhat_cross_mode`, `map_lps`; every other recorded key containing
+"rhat", "bfmi" or a `mode` word (e.g. `cross_mode_...`) is returned in `extra`.
+"""
+function convergence_summary(pd)
+    first_meta(keys...) = (for k in keys
+                               v = _fit_meta(pd, k, nothing)
+                               v === nothing || return v
+                           end; nothing)
+    nch = Int(_fit_meta(pd, "nchains", 1))
+    S = length(pd.σ)
+    recomputed = nothing
+    if S % nch == 0 && S ÷ nch >= 4
+        L = S ÷ nch
+        nm = ["μ_λ0", "ω_λ0", "μ_k2", "ω_k2", "logλ1", "logk1", "σ"]
+        cols = (pd.μ_λ0, pd.ω_λ0, pd.μ_k2, pd.ω_k2, pd.logλ1, pd.logk1, pd.σ)
+        arr = Array{Float64}(undef, L, length(nm), nch)
+        for c in 1:nch, (j, v) in enumerate(cols)
+            arr[:, j, c] = v[(c-1)*L+1:c*L]
+        end
+        ss = MCMCChains.summarystats(MCMCChains.Chains(arr, Symbol.(nm)))
+        recomputed = (names = nm, rhat = collect(Float64, ss.nt.rhat), ess_bulk = collect(Float64, ss.nt.ess_bulk),
+                      ess_tail = collect(Float64, ss.nt.ess_tail))
+    end
+    known = Set(["nchains", "draws_per_chain", "max_rhat", "min_ess_bulk", "min_ess_tail", "n_divergences", "min_ebfmi",
+                 "ebfmi", "max_tree_depth_hits", "mean_tree_depth", "mean_acceptance", "mean_step_size", "mean_n_steps",
+                 "cross_mode_rhat", "rhat_cross_mode", "map_lps"])
+    extra = Dict{String,Any}()
+    for d in (pd.diagnostics, get(pd.diagnostics, "settings", Dict{String,Any}()))
+        d isa AbstractDict || continue
+        for (k, v) in d
+            ks = String(k)
+            ks in known && continue
+            occursin(r"rhat|bfmi|(^|_)mode(_|$)", lowercase(ks)) && !(v isa AbstractVector{<:AbstractString}) && (extra[ks] = v)
+        end
+    end
+    return (nchains = nch, draws_per_chain = first_meta("draws_per_chain"), n_draws = S,
+            max_rhat = first_meta("max_rhat"), min_ess_bulk = first_meta("min_ess_bulk"),
+            min_ess_tail = first_meta("min_ess_tail"), n_divergences = first_meta("n_divergences"),
+            ebfmi = first_meta("min_ebfmi", "ebfmi"), max_tree_depth_hits = first_meta("max_tree_depth_hits"),
+            mean_tree_depth = first_meta("mean_tree_depth"), mean_acceptance = first_meta("mean_acceptance"),
+            mean_step_size = first_meta("mean_step_size"), mean_n_steps = first_meta("mean_n_steps"),
+            cross_mode_rhat = first_meta("cross_mode_rhat", "rhat_cross_mode"), map_lps = first_meta("map_lps"),
+            recomputed = recomputed, extra = extra)
+end
+
+# ----------------------------------------------------------------------------
+# Public-output guard (PDXE data must not be redistributed)
+# ----------------------------------------------------------------------------
+
+"Minimum number of distinct PDX models any public bin or summary must aggregate."
+const PUBLIC_MIN_PDX = 10
+
+"""
+    public_output_violations(; bins=[], summaries=[], text="", ids=[], figures=[], min_pdx=PUBLIC_MIN_PDX) -> Vector{String}
+
+Rules for report outputs that may be published (the PDXE data are licensed and must not be
+redistributed): every bin (`n_pdx` field) and summary (`n_pdx` field) aggregates at least `min_pdx` distinct
+PDX models; the text contains none of the PDX model `ids` (as a whole token); and no individual-level figure
+(file names ending `_bands.png` or `_response.png`, which show individual curves / per-PDX categories) is among
+`figures`. Returns the violations (empty = fine).
+"""
+function public_output_violations(; bins = NamedTuple[], summaries = NamedTuple[], text::AbstractString = "",
+                                  ids = String[], figures = String[], min_pdx::Integer = PUBLIC_MIN_PDX)
+    v = String[]
+    for b in bins
+        b.n_pdx < min_pdx && push!(v, "bin $(get(b, :arm, "")) $(get(b, :lo, "?"))-$(get(b, :hi, "?")) aggregates only $(b.n_pdx) PDX models (< $(min_pdx))")
+    end
+    for (i, sm) in enumerate(summaries)
+        sm.n_pdx < min_pdx && push!(v, "summary #$(i) aggregates only $(sm.n_pdx) PDX models (< $(min_pdx))")
+    end
+    for id in ids
+        isempty(id) && continue
+        occursin(Regex("(?<![A-Za-z0-9])\\Q" * String(id) * "\\E(?![A-Za-z0-9])"), text) &&
+            push!(v, "text contains the PDX id $(id)")
+    end
+    for f in figures
+        occursin(r"_(bands|response)\.png$", String(f)) &&
+            push!(v, "individual-level figure $(basename(String(f))) must go to the local output directory")
+    end
+    return v
+end
+
+"Throw if [`public_output_violations`](@ref) finds anything; used before writing public outputs."
+function assert_public_output(; kwargs...)
+    v = public_output_violations(; kwargs...)
+    isempty(v) || error("refusing to write public output: " * join(v, "; "))
+    return nothing
 end
 
 # ----------------------------------------------------------------------------

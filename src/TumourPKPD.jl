@@ -25,6 +25,7 @@ export simulate_regimen, simulate_control, predictive_bands, pdxe_response, pdxe
        spearman, auroc, ordinal_agreement, responder_fraction, drug_ranking_agreement,
        split_late, split_late_indices, split_models,
        scaled_regimen, make_regimen, is_extrapolation, simulate_trial, compare_trials, pdxe_like_grid,
-       chain_index_from_fit, detection_limit_from_fit, ensemble_failures
+       chain_index_from_fit, detection_limit_from_fit, ensemble_failures,
+       nu_from_fit, baseline_sd_from_fit, fit_window_day, latent_baseline, convergence_summary
 
 end

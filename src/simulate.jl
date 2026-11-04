@@ -43,7 +43,8 @@ function _simulate(pd, mkexpo, w0, w0mat::Matrix{Float64}, tgrid, ndraws, model,
     end
     newpdx && isempty(pool) && throw(ArgumentError("empty baseline model pool"))
     jpick = newpdx ? rand(rng, pool, n) : Int[]            # drawn before the noise (see simulate_regimen)
-    ε = obs_noise ? randn(rng, n, nt) : Matrix{Float64}(undef, 0, 0)
+    ν = nu_from_fit(pd)
+    ε = obs_noise ? (isinf(ν) ? randn(rng, n, nt) : rand(rng, TDist(ν), n, nt)) : Matrix{Float64}(undef, 0, 0)
 
     j = 0
     if model !== nothing
@@ -111,8 +112,9 @@ Baseline `w0` (mm^3) defaults to the draw's own baseline for a known model
 each row uses the draw-matched baseline of a training model picked at random
 (`pd.w0_treated_draws[i, j_r]`, `j_r` uniform over the fit's models, or over `baseline_models`
 if given), i.e. the training set's baseline distribution. A user `w0` (scalar, or a vector with
-one entry per row) overrides both. `obs_noise=true` multiplies by lognormal noise
-`exp(σ ε)` at every `t > 0` (the baseline is conditioned on). Rows whose ODE solve fails
+one entry per row) overrides both. `obs_noise=true` multiplies by noise
+`exp(σ ε)` at every `t > 0`, `ε ~ Student-t(ν)` with `ν = nu_from_fit(pd)` (the fit's `diagnostics["nu"]`, 5 if
+absent, `Inf` = Normal), i.e. the fitted observation model (the baseline is conditioned on). Rows whose ODE solve fails
 are filled with NaN. With `details=true` returns `(y, idx, σ, λ0, k2, w0)` where `idx` are the
 stored-draw indices used (needed for log predictive density with `obs_noise=false`).
 
@@ -166,6 +168,28 @@ function predictive_bands(sims::AbstractMatrix; levels = (0.05, 0.5, 0.95))
     end
     return out
 end
+
+"""
+    fit_window_day(pd) -> Union{Float64,Nothing}
+
+The fit's data window (`diagnostics["fit_window_day"]`, e.g. 42 for the primary and 21 for the late21
+design); `nothing` if not recorded or 0 (= full follow-up).
+"""
+function fit_window_day(pd)
+    v = _fit_meta(pd, "fit_window_day", nothing)
+    (v === nothing || !(v > 0) || isinf(v)) && return nothing
+    return float(v)
+end
+
+"""
+    latent_baseline(pd, v0, n; rng) -> Vector
+
+`n` draws of a test PDX's latent baseline given its observed baseline volume `v0`:
+`v0 * exp(τ z)`, `z ~ N(0,1)`, `τ = baseline_sd_from_fit(pd)` (0.1 for the Student-t fits). Pass as `w0=` to
+condition a prediction on the observed baseline with the fitted measurement error.
+"""
+latent_baseline(pd, v0::Real, n::Integer; rng::AbstractRNG = Random.default_rng()) =
+    v0 .* exp.(baseline_sd_from_fit(pd) .* randn(rng, n))
 
 # ---------------------------------------------------------------------------------------------
 # What-if regimens
@@ -238,8 +262,9 @@ against a long reference schedule). Anything that differs is flagged with a reas
 at times the reference does not have or shifted doses, and dosing that stops before the reference
 does (including missed final doses). Predicting beyond the longest observed follow-up
 (`horizon > observed_max_day`) is also flagged. Returns the flag and the human-readable `reasons`
-(empty if none). Also accepts a `PosteriorDraws` as `ref` (uses `pd.doses` and the saved
-`max_observed_day`, when the fit records it).
+(empty if none). Also accepts a `PosteriorDraws` as `ref` (uses `pd.doses`, the saved
+`max_observed_day` and the saved `fit_window_day`, when the fit records them; a horizon beyond the fit window is
+flagged "beyond the fitted N-day window").
 """
 function is_extrapolation(ref::AbstractVector{Dose}, doses::AbstractVector{Dose};
                           horizon = nothing, observed_max_day = nothing)
@@ -317,6 +342,11 @@ end
 function is_extrapolation(pd, doses::AbstractVector{Dose}; horizon = nothing, observed_max_day = nothing)
     omd = observed_max_day === nothing ? _fit_meta(pd, "max_observed_day", nothing) : observed_max_day
     flag, reasons = is_extrapolation(pd.doses, doses; horizon, observed_max_day = omd)
+    fw = fit_window_day(pd)
+    if horizon !== nothing && fw !== nothing && horizon > fw + 1e-9
+        push!(reasons, "prediction horizon $(horizon) d is beyond the fitted $(round(Int, fw))-day window (the model only saw data up to day $(round(Int, fw)))")
+        flag = true
+    end
     if horizon !== nothing && omd === nothing
         push!(reasons, "longest observed follow-up is not recorded in the fit (diagnostics[\"max_observed_day\"]), so the horizon cannot be checked")
         flag = true
@@ -366,7 +396,9 @@ noise), classifies every tumour with `classifier` (default [`pdxe_response_paper
 twice-weekly grid up to `horizon` days, and returns per-draw responder rate (mCR+mPR) and category
 fractions. `ndraws` is capped at the number of stored draws.
 
-- `horizon` defaults to the fit's saved `median_followup_day` if present, else 28 days. Responder
+- `horizon` defaults to `min(median_followup_day or 28, fit_window_day)`; an explicit `horizon` beyond
+  the fit window (`diagnostics["fit_window_day"]`, 42 d for the primary fits) is run but flagged in
+  `extrapolation` as "beyond the fitted N-day window". Responder
   rates depend on follow-up length, so compare with PDXE at a matching horizon. `tgrid` overrides
   the grid (must start at 0).
 - `tumour_type` restricts the baseline pool to training PDX of that type; this needs the fit to
@@ -407,7 +439,13 @@ function simulate_trial(pd, doses::AbstractVector{Dose}; n_pdx::Integer = 200, n
         ndraws = min(ndraws, 50); n_pdx = min(n_pdx, 100); n_pdx_population = min(n_pdx_population, 400)
     end
     population && (n_pdx = n_pdx_population)
-    hz = horizon === nothing ? float(_fit_meta(pd, "median_followup_day", 28.0)) : float(horizon)
+    fw = fit_window_day(pd)
+    hz = if horizon === nothing
+        h0 = float(_fit_meta(pd, "median_followup_day", 28.0))
+        fw === nothing ? h0 : min(h0, fw)
+    else
+        float(horizon)          # an explicit horizon beyond the fit window is allowed but flagged
+    end
     tg = tgrid === nothing ? pdxe_like_grid(hz) : collect(Float64, tgrid)
     (first(tg) == 0 && issorted(tg)) || throw(ArgumentError("tgrid must be sorted and start at day 0"))
     hz = last(tg)

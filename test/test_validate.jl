@@ -1,6 +1,6 @@
 # Tests for src/simulate.jl and src/validate.jl.
 # Run: julia --project=TumourPKPD.jl -t 2 TumourPKPD.jl/test/test_validate.jl
-using Test, Random, Statistics
+using Test, Random, Statistics, Distributions
 using TumourPKPD
 import StatsBase, ParetoSmooth
 
@@ -111,11 +111,19 @@ end
     # log predictive density: mixture over identical draws equals the lognormal density on volume scale
     latent = fill(exp(1.0), 50, 1); σ = fill(0.3, 50)
     yv = 3.0
-    lp = TP.log_predictive_density([yv], latent, σ)
+    lp = TP.log_predictive_density([yv], latent, σ; nu = Inf)
     @test lp[1] ≈ (-0.5 * ((log(yv) - 1) / 0.3)^2 - log(0.3) - 0.5 * log(2π)) - log(yv) atol = 1e-12
     # left-censored: P(y < limit) with limit = exp(1) is 0.5
-    @test TP.log_predictive_density([0.0], latent, σ; limit = exp(1.0))[1] ≈ log(0.5) atol = 1e-6
-    @test isnan(TP.log_predictive_density([0.0], latent, σ)[1])
+    @test TP.log_predictive_density([0.0], latent, σ; limit = exp(1.0), nu = Inf)[1] ≈ log(0.5) atol = 1e-6
+    @test isnan(TP.log_predictive_density([0.0], latent, σ; nu = Inf)[1])
+    # Student-t observation model (default nu = 5): scaled-t density and t CDF for the censored mass
+    lt = TP.log_predictive_density([yv], latent, σ)[1]
+    @test lt ≈ logpdf(TDist(5.0), (log(yv) - 1) / 0.3) - log(0.3) - log(yv) atol = 1e-10
+    @test TP.log_predictive_density([yv], latent, σ; nu = 5.0)[1] == lt
+    @test TP.log_predictive_density([yv], latent, σ; nu = 1e9)[1] ≈ lp[1] atol = 1e-4                  # large nu -> Normal
+    lim = exp(1.0 - 0.3)                                                                  # one scale unit below the median
+    @test TP.log_predictive_density([0.0], latent, σ; limit = lim)[1] ≈ logcdf(TDist(5.0), -1.0) atol = 1e-10
+    @test TP.log_predictive_density([0.0], latent, σ; limit = lim, nu = Inf)[1] ≈ logcdf(Normal(), -1.0) atol = 1e-6
     # KDE variant approximates the true density
     noisy = exp.(1.0 .+ 0.3 .* randn(rng, 20000, 1))
     @test TP.log_predictive_density_kde([3.0], noisy)[1] ≈ lp[1] atol = 0.05
@@ -126,11 +134,11 @@ end
     @test TP.coverage([0.0, 0.0, 0.0, 0.0], sf; level = 0.99) ≤ 0.75          # the empty column is a miss, not dropped
     @test isnan(TP.crps([0.0, 0.0, 0.0, 0.0], sf)[4]) && isfinite(TP.crps([0.0, 0.0, 0.0, 0.0], sf)[1])
     @test isnan(TP.interval_width(sf)[4])
-    lf = TP.log_predictive_density([2.0, 2.0], hcat(fill(2.0, 50), fill(NaN, 50)), fill(0.3, 50))
+    lf = TP.log_predictive_density([2.0, 2.0], hcat(fill(2.0, 50), fill(NaN, 50)), fill(0.3, 50); nu = Inf)
     @test isfinite(lf[1]) && lf[2] == -Inf                                      # no valid draw: -Inf kept
     half = fill(2.0, 50); half[1:25] .= NaN                                     # half the draws failed: log(1/2) penalty
-    lh = TP.log_predictive_density([2.0], reshape(half, :, 1), fill(0.3, 50))[1]
-    @test lh ≈ TP.log_predictive_density([2.0], fill(2.0, 50, 1), fill(0.3, 50))[1] + log(0.5)
+    lh = TP.log_predictive_density([2.0], reshape(half, :, 1), fill(0.3, 50); nu = Inf)[1]
+    @test lh ≈ TP.log_predictive_density([2.0], fill(2.0, 50, 1), fill(0.3, 50); nu = Inf)[1] + log(0.5)
     # cluster bootstrap of a mean: spread ≈ sd/√ngroups
     gv = repeat(1:40, inner = 10); vals = randn(rng, 400)
     bs = TP.cluster_bootstrap(idx -> mean(vals[idx]), gv; nboot = 400, rng = rng)
@@ -216,7 +224,7 @@ function toy_pd(; S = 40, ω = 0.0, σ = 0.1)
        fill(log(0.15), S), fill(ω, S), fill(log(0.6), S), fill(ω, S),
        fill(log(2.0), S), fill(log(0.5), S), fill(σ, S),
        hcat(fill(0.15, S), fill(0.10, S)), hcat(fill(0.6, S), fill(1.5, S)),
-       [100.0, 150.0], [120.0, 160.0], Dict{String,Any}())
+       [100.0, 150.0], [120.0, 160.0], Dict{String,Any}("nu" => Inf))      # Normal noise unless a test sets nu
 end
 
 @testset "simulate_regimen" begin
@@ -254,6 +262,15 @@ end
     a = TP.simulate_regimen(pdn, pdn.doses; model = "A", tgrid = tg, ndraws = 50, rng = MersenneTwister(9))
     b = TP.simulate_regimen(pdn, pdn.doses; model = "A", tgrid = tg, ndraws = 50, rng = MersenneTwister(9))
     @test a == b
+    # Student-t observation noise (fit's nu; default 5 when the fit does not record it)
+    pdt5 = toy_pd(S = 6000, σ = 0.2); pdt5.diagnostics["nu"] = 5.0
+    @test TP.nu_from_fit(pdt5) == 5.0 && TP.nu_from_fit(pd) == Inf
+    delete!(pdt5.diagnostics, "nu"); @test TP.nu_from_fit(pdt5) == 5.0
+    st = TP.simulate_regimen(pdt5, pdt5.doses; model = "A", tgrid = tg, ndraws = 6000, rng = MersenneTwister(8))
+    zt = (log.(st[:, 5]) .- log(wref[5])) ./ 0.2
+    @test std(zt) ≈ sqrt(5 / 3) rtol = 0.1                                      # t5 has variance 5/3
+    @test count(abs.(zt) .> 4) / 6000 > 0.003                                    # heavy tails (Normal: 6e-5)
+    @test all(st[:, 1] .== 120.0)
     @test_throws ArgumentError TP.simulate_regimen(pd, pd.doses; tgrid = tg)
     @test_throws ArgumentError TP.simulate_regimen(pd, pd.doses; model = "A", newpdx = true, tgrid = tg)
     @test_throws ArgumentError TP.simulate_regimen(pd, pd.doses; model = "Z", tgrid = tg)
@@ -469,7 +486,7 @@ end
         λ0 = exp(pd.μ_λ0[1] + pd.ω_λ0[1] * randn(rng)); k2 = exp(pd.μ_k2[1] + pd.ω_k2[1] * randn(rng))
         w0 = pd.w0_treated[rand(rng, 1:length(pd.models))]
         w, ok = simulate_tumour(Simeoni(λ0, exp(pd.logλ1[1]), exp(pd.logk1[1]), k2, w0), ex_, tg)
-        v = [t == 0 ? w0 : (x = max(w[i], 0.0) * exp(pd.σ[1] * randn(rng)); x < 4.0 ? 0.0 : x) for (i, t) in enumerate(tg)]
+        v = [t == 0 ? w0 : (x = max(w[i], 0.0) * exp(pd.σ[1] * rand(rng, TDist(5.0))); x < 4.0 ? 0.0 : x) for (i, t) in enumerate(tg)]
         c = TP.pdxe_response_paper(tg, v).category
         hit += TP.is_responder(c); cat_counts[findfirst(==(c), TP.RESPONSE_CATEGORIES)] += 1
     end
@@ -539,4 +556,70 @@ end
     cmpp = TP.compare_trials(pd, Dict("ref" => doses, "double" => TP.scaled_regimen(doses; multiplier = 2.0));
                              n_pdx_population = 300, ndraws = 6, population = true, baseline = "ref")
     @test occursin("population response probability", cmpp.contrast_kind) && cmpp.contrasts["double"].median > 0
+end
+
+# ---------------------------------------------------------------- Phase 3: fit window, convergence summary
+@testset "fit window and convergence helpers" begin
+    base = Dict{String,Any}("settings" => Dict{String,Any}("lod" => 4.0), "fit_window_day" => 42.0,
+                            "max_observed_day" => 42.0, "median_followup_day" => 50.0)
+    pd, doses = synth_pd(diag = copy(base))
+    @test TP.fit_window_day(pd) == 42.0
+    # default horizon = min(median follow-up, fit window); no flag inside the window
+    t = TP.simulate_trial(pd, doses; n_pdx = 20, ndraws = 4, rng = MersenneTwister(1))
+    @test t.horizon == 42.0 && t.extrapolation == (false, String[])
+    pd21, _ = synth_pd(diag = merge(base, Dict("fit_window_day" => 21.0, "median_followup_day" => 28.0)))
+    t21 = TP.simulate_trial(pd21, doses; n_pdx = 20, ndraws = 4, rng = MersenneTwister(1))
+    @test t21.horizon == 21.0 && !t21.extrapolation[1]
+    # an explicit horizon beyond the window runs but is flagged
+    tb = TP.simulate_trial(pd21, doses; n_pdx = 20, ndraws = 4, horizon = 35.0, rng = MersenneTwister(1))
+    @test tb.horizon == 35.0 && tb.extrapolation[1] && any(occursin("beyond the fitted 21-day window", r) for r in tb.extrapolation[2])
+    @test TP.is_extrapolation(pd21, pd21.doses; horizon = 21.0) == (false, String[])
+    # full-follow-up fits (window 0) never trigger it
+    pd0, _ = synth_pd(diag = merge(base, Dict("fit_window_day" => 0.0)))
+    @test TP.fit_window_day(pd0) === nothing && !TP.is_extrapolation(pd0, pd0.doses; horizon = 30.0)[1]
+    # latent baseline draws
+    pdl, _ = synth_pd(diag = Dict{String,Any}("baseline_sd" => 0.1))
+    wb = TP.latent_baseline(pdl, 200.0, 20000; rng = MersenneTwister(2))
+    @test isapprox(std(log.(wb)), 0.1; rtol = 0.05) && isapprox(mean(log.(wb)), log(200.0); atol = 0.01)
+    @test TP.baseline_sd_from_fit(pd0) == 0.1                                          # default
+
+    # convergence summary: iid draws in 4 chains -> R-hat ~ 1, ESS ~ draws; recorded items are passed through
+    rng = MersenneTwister(5); S = 400
+    dg = Dict{String,Any}("nchains" => 4, "max_rhat" => 1.004, "min_ess_bulk" => 310.0, "n_divergences" => 0,
+                          "min_ebfmi" => 0.8, "max_tree_depth_hits" => 2, "cross_mode_rhat" => 1.01,
+                          "map_lps" => [1.0, 2.0], "rhat_other_mode_check" => 1.2, "train_models" => ["a"], "mode_masses" => [0.5, 0.5], "settings" => Dict{String,Any}("lod" => 4.0))
+    b, _ = synth_pd(S = S, diag = dg)
+    b.μ_λ0 .= randn(rng, S); b.ω_λ0 .= exp.(0.1 .* randn(rng, S)); b.μ_k2 .= randn(rng, S); b.ω_k2 .= exp.(0.1 .* randn(rng, S))
+    b.logλ1 .= randn(rng, S); b.logk1 .= randn(rng, S); b.σ .= exp.(0.1 .* randn(rng, S))
+    cs = TP.convergence_summary(b)
+    @test cs.nchains == 4 && cs.n_draws == S && cs.max_rhat == 1.004 && cs.ebfmi == 0.8 && cs.cross_mode_rhat == 1.01
+    @test cs.recomputed !== nothing && length(cs.recomputed.names) == 7 && all(0.98 .< cs.recomputed.rhat .< 1.03)
+    @test all(cs.recomputed.ess_bulk .> 0.5 * S) && all(cs.recomputed.ess_tail .> 0.3 * S)
+    @test haskey(cs.extra, "rhat_other_mode_check") && !haskey(cs.extra, "train_models") && haskey(cs.extra, "mode_masses")
+    # chains that sit in different places give a large R-hat; a missing item is `nothing`
+    b.μ_k2 .= repeat(1:4, inner = S ÷ 4) .+ 0.01 .* randn(rng, S)
+    @test maximum(TP.convergence_summary(b).recomputed.rhat) > 2
+    cm = TP.convergence_summary(synth_pd(diag = Dict{String,Any}())[1])
+    @test cm.ebfmi === nothing && cm.cross_mode_rhat === nothing && cm.nchains == 1
+end
+
+@testset "public output guard" begin
+    ok_bins = [(arm = :treated, lo = 0.0, hi = 14.0, n_pdx = 12), (arm = :control, lo = 0.0, hi = 14.0, n_pdx = 10)]
+    @test TP.PUBLIC_MIN_PDX == 10
+    @test isempty(TP.public_output_violations(bins = ok_bins, summaries = [(n_pdx = 25,)], text = "aggregated text only",
+                                              ids = ["X-007", "X-010"], figures = ["docs/fig_d_logratio.png", "docs/fig_d_calibration.png", "docs/fig_d_responsecal.png"]))
+    # small bins and summaries
+    v = TP.public_output_violations(bins = [(arm = :treated, lo = 0.0, hi = 7.0, n_pdx = 9)], summaries = [(n_pdx = 3,)])
+    @test length(v) == 2 && any(occursin("9 PDX", x) for x in v) && any(occursin("3 PDX", x) for x in v)
+    # ids as whole tokens only
+    v = TP.public_output_violations(text = "X-007 treated at day 14", ids = ["X-007"])
+    @test length(v) == 1 && occursin("X-007", v[1])
+    @test isempty(TP.public_output_violations(text = "group X-0071 and X-0070", ids = ["X-007"]))
+    @test !isempty(TP.public_output_violations(text = "(see X-007)", ids = ["X-007"]))
+    # individual-level figures
+    v = TP.public_output_violations(figures = ["docs/fig_BKM120_bands.png", "docs/fig_BKM120_response.png", "docs/fig_BKM120_responsecal.png"])
+    @test length(v) == 2
+    @test_throws ErrorException TP.assert_public_output(bins = [(arm = :treated, lo = 0.0, hi = 7.0, n_pdx = 2)])
+    @test TP.assert_public_output(bins = ok_bins) === nothing
+    @test TP.public_output_violations(summaries = [(n_pdx = 4,)], min_pdx = 3) == String[]
 end
