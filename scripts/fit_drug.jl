@@ -139,7 +139,7 @@ function main(args)
     chain_only = haskey(opts, "chain-only")
     if chain_only                                  # child process: one chain from the shared start, save it, done
         k = parse(Int, opts["chain-only"])
-        init, k2c = haskey(opts, "init-file") ? load_init(opts["init-file"]) : (nothing, nothing)
+        init, k2c = haskey(opts, "init-file") ? load_init(opts["init-file"]; chain = k) : (nothing, nothing)
         chain, _ = M.fit_drug(train, doses, pk, cref; kw..., nchains = 1, chain_only = true, init, k2_centered = k2c,
                               map_starts = init === nothing ? mapstarts : 0, map_maxiters = mapiters,
                               rng = MersenneTwister(1000 * seed + k), log_every = 25, logger = stamp)
@@ -152,15 +152,19 @@ function main(args)
         init_file = ""
         map_lps = nothing
         k2c = nothing
+        mode_idx = nothing; mode_lps = nothing
         if mapstarts > 0
             stamp("multi-start MAP: $mapstarts starts, <= $mapiters iterations each")
-            nt, map_lps, _, k2c = M.map_init(train, doses, pk, cref; window_days = window, nu, baseline_sd = bsd,
-                                        latent_w0 = latent, nstarts = mapstarts, maxiters = mapiters,
-                                        rng = MersenneTwister(seed), logger = stamp)
+            mm = M.map_modes(train, doses, pk, cref; window_days = window, nu, baseline_sd = bsd,
+                             latent_w0 = latent, nstarts = mapstarts, maxiters = mapiters,
+                             rng = MersenneTwister(seed), logger = stamp)
+            map_lps = mm.all_lps; k2c = mm.k2_centered
+            mode_idx = [mod1(k, length(mm.starts)) for k in 1:nchains]; mode_lps = [m.lp for m in mm.starts]
             stamp("MAP log-densities of all starts: " * join(round.(map_lps; digits = 1), ", ") *
-                  "; best " * string(round(maximum(map_lps); digits = 1)))
+                  "; $(length(mm.starts)) distinct mode(s), best " * string(round(maximum(map_lps); digits = 1)) *
+                  "; chain k starts at mode mod1(k, $(length(mm.starts)))")
             init_file = joinpath(mktempdir(), "init.jld2")
-            save_init(init_file, nt, k2c)
+            save_init(init_file, [m.nt for m in mm.starts], k2c)
         end
         childargs = String[drug, mode, "1", string(nadapt), string(ndraws), "--seed=$seed", "--target=$target",
                            "--window=$window", "--nu=$nu", "--baseline-sd=$bsd", "--mapstarts=$mapstarts"]
@@ -174,7 +178,8 @@ function main(args)
         worker_info = (; worker_threads = cthreads, chain_seeds = [1000 * seed + k for k in 1:nchains],
                        worker_processes = true)
         _, pd = M.fit_drug(train, doses, pk, cref; kw..., precomputed_chain = chain, precomputed_runtime = wall,
-                           map_lps, worker_info, k2_centered = k2c)
+                           map_lps, worker_info, k2_centered = k2c,
+                           chain_start_modes = mode_idx, distinct_mode_lps = mode_lps)
     else
         _, pd = M.fit_drug(train, doses, pk, cref; kw..., nchains, rng = MersenneTwister(seed), log_every = 25, logger = stamp,
                            map_starts = mapstarts, map_maxiters = mapiters)

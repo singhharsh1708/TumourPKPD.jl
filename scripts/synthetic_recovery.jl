@@ -4,7 +4,7 @@
 #
 # Simulates N PDX units (control + treated) from known population parameters, fits them, and reports
 # true vs posterior median vs 90% CrI, per-unit coverage of λ0 and k2, diagnostics and timings.
-# Output goes to stdout (redirect to ~/Work/tumour-pkpd/logs/2026-11-04-inference-*.log).
+# Output goes to stdout (redirect to a log file of your choice).
 
 using TumourPKPD, Random, Statistics, Printf
 using TumourPKPD: Dose, OneCmt, dosing_schedule, conc
@@ -54,7 +54,7 @@ CHILD > 0 || println("final control volume (median, max): ",
         round(median(last(u.control.v) for u in units); digits = 0), " ", round(maximum(last(u.control.v) for u in units); digits = 0))
 
 if CHILD > 0                                      # child process: sample one chain, save, exit
-    init, k2c = isempty(INIT_FILE) ? (nothing, nothing) : load_init(INIT_FILE)
+    init, k2c = isempty(INIT_FILE) ? (nothing, nothing) : load_init(INIT_FILE; chain = CHILD)
     chain, _ = H.fit_drug(units, doses, pk, cref; nchains = 1, nsamples, nadapt, chain_only = true, init, k2_centered = k2c,
                           map_starts = 0, window_days = 0,
                           rng = MersenneTwister(1000 * seed + CHILD), latent_w0, priors = PRIORS, log_every = 25,
@@ -98,8 +98,9 @@ println("\n## fit")
 fitkw = (; drug = "synthetic_$(tag)", nsamples, nadapt, latent_w0, progress = false, priors = PRIORS, seed, window_days = 0)
 if nchains > 1 && Threads.nthreads() > 1 && !NOPROCS
     println("multi-start MAP (5 starts) in the parent, then $nchains chains in separate processes"); flush(stdout)
-    nt0, map_lps, _, k2c = H.map_init(units, doses, pk, cref; window_days = 0, latent_w0, priors = PRIORS, nstarts = 5,
-                                 maxiters = 1000, rng = MersenneTwister(seed + 2))
+    mm0 = H.map_modes(units, doses, pk, cref; window_days = 0, latent_w0, priors = PRIORS, nstarts = 5,
+                      maxiters = 1000, rng = MersenneTwister(seed + 2))
+    map_lps = mm0.all_lps; k2c = mm0.k2_centered; nt0 = [m.nt for m in mm0.starts]
     println("MAP log-densities of the starts: ", round.(map_lps; digits = 1)); flush(stdout)
     init_file = joinpath(mktempdir(), "init.jld2"); save_init(init_file, nt0, k2c)
     maxprocs = max(1, Threads.nthreads() ÷ CTHREADS)

@@ -1,0 +1,47 @@
+name: CI
+
+# PDXE is public source data that this repository must not redistribute. It is downloaded from the original
+# Springer URL inside the test job on every run (pull requests from forks included) and lives only on that runner:
+# no actions/cache, no artifact. Fork pull requests get no secrets, so they can reach nothing but the public source.
+# Only the Julia depot (code) is cached.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Julia 1.10, ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2.7.0
+        with:
+          version: '1.10'
+
+      - uses: julia-actions/cache@d10a6fd8f31b12404a54613ebad242900567f2b9 # v2.1.0
+
+      - name: Instantiate and precompile
+        run: julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+
+      - name: Download PDXE from the source (sha256 verified, with retry) and clean
+        run: |
+          export TUMOURPKPD_RAW_DIR="$RUNNER_TEMP/pdxe-raw"
+          julia scripts/ci_fetch_pdxe.jl
+          julia --project data/clean.jl
+
+      - name: Tests (fast suite, skips the ModelingToolkit cross-check)
+        env:
+          TUMOURPKPD_FAST: '1'
+        run: julia --project -t 2 test/runtests.jl

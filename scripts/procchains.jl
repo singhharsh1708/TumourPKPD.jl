@@ -13,13 +13,22 @@ function load_chain_parts(path)
     return TumourPKPD.chain_from_parts(d["data"], d["names"], d["internals"])
 end
 
-function save_init(path, nt::NamedTuple, k2_centered::AbstractVector{Bool})
-    jldsave(path; keys = collect(String.(keys(nt))), vals = collect(Any, values(nt)), k2_centered = collect(Bool, k2_centered))
+function save_init(path, nts::AbstractVector, k2_centered::AbstractVector{Bool})
+    jldsave(path; modes = [(; keys = collect(String.(keys(nt))), vals = collect(Any, values(nt))) for nt in nts],
+            k2_centered = collect(Bool, k2_centered))
 end
-"Returns (start NamedTuple, k2_centered mask) written by `save_init`."
-function load_init(path)
+save_init(path, nt::NamedTuple, k2_centered::AbstractVector{Bool}) = save_init(path, [nt], k2_centered)
+
+"""
+    load_init(path; chain=1) -> (start NamedTuple, k2_centered mask)
+
+Start of chain `chain` from the file written by `save_init`: distinct modes are cycled over chains (chain k -> mode mod1(k, nmodes)),
+so chains start from different discovered modes when more than one exists.
+"""
+function load_init(path; chain::Integer = 1)
     d = JLD2.load(path)
-    return NamedTuple{Tuple(Symbol.(d["keys"]))}(Tuple(d["vals"])), collect(Bool, d["k2_centered"])
+    m = d["modes"][mod1(chain, length(d["modes"]))]
+    return NamedTuple{Tuple(Symbol.(m.keys))}(Tuple(m.vals)), collect(Bool, d["k2_centered"])
 end
 
 """

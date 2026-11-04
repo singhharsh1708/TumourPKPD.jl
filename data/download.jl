@@ -2,7 +2,7 @@
 #
 #   julia --project=. data/download.jl [dir] [--only=xlsx|pdf]
 #
-# dir defaults to $TUMOURPKPD_RAW_DIR, else ~/Work/tumour-pkpd/downloads/pdxe if it exists, else data/cache/raw.
+# dir defaults to $TUMOURPKPD_RAW_DIR, else data/cache/raw (a legacy local directory is also used if it exists).
 # Raw files are never committed (data/cache is gitignored).
 
 using Downloads, SHA

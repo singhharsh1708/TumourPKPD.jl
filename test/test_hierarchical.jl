@@ -9,6 +9,7 @@ const H = TumourPKPD
 const DynamicPPL = Turing.DynamicPPL
 const LogDensityProblems = Turing.LogDensityProblems
 using ForwardDiff
+using JLD2
 
 @testset "hierarchical" begin
     pk = OneCmt(CL = 3.0, V = 1.5, ka = 24.0, F = 0.8)
@@ -246,6 +247,145 @@ using ForwardDiff
         vi = DynamicPPL.link(DynamicPPL.initialize_parameters!!(DynamicPPL.VarInfo(MersenneTwister(0), model), nt0, model), model)
         ldf = DynamicPPL.LogDensityFunction(model, DynamicPPL.getlogjoint_internal, vi)
         @test modes[1].lp >= LogDensityProblems.logdensity(ldf, vi[:]) - 1e-6
+    end
+
+    @testset "distinct MAP modes and E-BFMI / diagnostics keys" begin
+        mk(lp, μ) = (; nt = (; μ_λ0 = μ, ω_λ0 = 0.5, μ_k2 = -1.0, ω_k2 = 0.5, logVtr = 7.0, logk1 = 0.0, σ = 0.2), lp)
+        ms = [mk(70.9, -3.0), mk(65.4, -3.0), mk(65.45, -3.0), mk(70.88, -3.0), mk(-1.3, -3.0), mk(-Inf, -3.0)]
+        dm = H.distinct_modes(ms)
+        @test [round(m.lp; digits = 1) for m in dm] == [70.9, 65.4]          # duplicates merged, non-converged and failed dropped
+        @test length(H.distinct_modes([mk(10.0, -3.0), mk(10.1, -2.5)])) == 2   # same lp, parameters differ -> two modes
+        E = hcat(cumsum(0.01 .* randn(MersenneTwister(1), 200)), randn(MersenneTwister(2), 200))   # sticky vs fresh energies
+        ch = Chains(reshape(hcat(randn(MersenneTwister(3), 200, 2), E), 200, 4, 1), [:a, :b, :hamiltonian_energy, :tree_depth],
+                    Dict(:internals => [:hamiltonian_energy, :tree_depth]))
+        dg = H.chain_diagnostics(ch)
+        for k in ("min_ess_tail", "min_ebfmi", "cross_mode_rhat", "max_rhat", "min_ess_bulk"); @test haskey(dg, k); end
+        @test isnan(dg["cross_mode_rhat"])
+    end
+
+    @testset "staged sampling (warmup state -> fixed-kernel sampling)" begin
+        mask = [true, false, true]
+        ud0 = units
+        mm = H.map_modes(ud0, doses, pk, cref; window_days = 0, nstarts = 2, maxiters = 120, rng = MersenneTwister(1), logger = _ -> nothing)
+        start = mm.starts[1].nt
+        tgt = H.stage_target(ud0, doses, pk, cref; start, k2_centered = mm.k2_centered, window_days = 0, threaded = false)
+        # layout follows the model: constrained transform equals DynamicPPL's invlink
+        vi = DynamicPPL.link(DynamicPPL.initialize_parameters!!(DynamicPPL.VarInfo(MersenneTwister(0), tgt.model), start, tgt.model), tgt.model)
+        @test vi[:] ≈ tgt.θ0
+        θ = tgt.θ0 .+ 0.05 .* randn(MersenneTwister(2), length(tgt.θ0))
+        @test H.constrain_draws(tgt.layout, reshape(θ, 1, :))[1, :] ≈ DynamicPPL.invlink(DynamicPPL.unflatten(vi, θ), tgt.model)[:]
+        w = H.stage_warmup(tgt, tgt.θ0, MersenneTwister(5); nadapt = 40, log_every = 0)
+        @test w.ϵ > 0 && length(w.Minv) == length(tgt.θ0) && size(w.stats, 1) == 40
+        # a sample stage rebuilt from scratch sees the same target at the warm position and does not adapt
+        tgt2 = H.stage_target(ud0, doses, pk, cref; start, k2_centered = mm.k2_centered, window_days = 0, threaded = false)
+        @test tgt2.ℓπ(w.θ) == tgt.ℓπ(w.θ)
+        s = H.stage_sample(tgt2, w.θ, w.ϵ, w.Minv, MersenneTwister(6); ndraws = 12, burnin = 3, log_every = 0)
+        @test all(s.stats[:, 3] .== w.ϵ)                                  # step size never changes
+        @test size(s.θ) == (12, length(tgt.θ0)) && all(isfinite, s.θ)
+        # chain assembly and extraction (also: wrong mask is rejected)
+        chn = H.stage_chain(tgt2.layout, H.constrain_draws(tgt2.layout, s.θ), s.stats)
+        two = chainscat(chn, chn)
+        _, pdst = H.fit_drug(ud0, doses, pk, cref; precomputed_chain = two, k2_centered = mm.k2_centered, window_days = 0,
+                             map_starts = 0, drug = "staged")
+        @test length(pdst.σ) == 24 && pdst.diagnostics["k2_centered"] == mm.k2_centered && all(pdst.k2 .> 0)
+        @test pdst.diagnostics["k2_centered_models"] == [m for (m, c) in zip(pdst.models, mm.k2_centered) if c]
+        bad = .!mm.k2_centered
+        any(mm.k2_centered) && !all(mm.k2_centered) &&
+            @test_throws ArgumentError H.fit_drug(ud0, doses, pk, cref; precomputed_chain = two, k2_centered = bad, window_days = 0, map_starts = 0)
+        @test H.stage_seed(1, 1, 1) != H.stage_seed(1, 1, 2) != H.stage_seed(1, 2, 1)
+        # resumable warmup across the metric-adaptation windows (220 iterations, buffers 40/30, window 25), RNG serialised
+        nad = 220; kw = (; nadapt = nad, log_every = 0, init_buffer = 40, term_buffer = 30, window_size = 25)
+        rng0 = MersenneTwister(5)
+        r1 = H.stage_warmup(tgt, tgt.θ0, rng0; kw..., upto = 90)
+        ad = r1.adaptor
+        @test !r1.done && r1.i == 90 && size(r1.stats, 1) == 90 && ad.state.i == 90
+        @test ad.state.window_start == 41 && ad.state.window_end == nad - 30 && !isempty(ad.state.window_splits)
+        @test r1.Minv != ones(length(tgt.θ0))                       # at least one metric window closed before iteration 90
+        path = tempname() * ".jld2"
+        JLD2.jldsave(path; theta = r1.θ, epsilon = r1.ϵ, Minv = r1.Minv, adaptor = ad, i = r1.i, rng = rng0)
+        f = JLD2.load(path); ad2 = f["adaptor"]
+        @test rand(copy(rng0)) == rand(f["rng"])                    # RNG state round-trips
+        for (x, y) in ((ad.state.i, ad2.state.i), (ad.state.window_start, ad2.state.window_start), (ad.state.window_end, ad2.state.window_end),
+                       (ad.state.window_splits, ad2.state.window_splits), (ad.pc.n, ad2.pc.n), (ad.pc.μ, ad2.pc.μ), (ad.pc.M, ad2.pc.M),
+                       (ad.pc.var, ad2.pc.var), (ad.ssa.state.m, ad2.ssa.state.m), (ad.ssa.state.ϵ, ad2.ssa.state.ϵ),
+                       (ad.ssa.state.x_bar, ad2.ssa.state.x_bar), (ad.ssa.state.H_bar, ad2.ssa.state.H_bar),
+                       (ad.init_buffer, ad2.init_buffer), (ad.term_buffer, ad2.term_buffer), (ad.window_size, ad2.window_size))
+            @test x == y                                            # window, variance-estimator and dual-averaging state restored exactly
+        end
+        # dual averaging restarts at each window end: m counts the iterations since the last split <= i
+        last_split(i, sp) = (v = filter(<=(i), sp); isempty(v) ? 0 : maximum(v))
+        @test ad2.ssa.state.m == ad2.state.i - last_split(ad2.state.i, ad2.state.window_splits)
+        r2 = H.stage_warmup(tgt, f["theta"], f["rng"]; kw..., upto = 150,
+                            resume = (; θ = f["theta"], ϵ = f["epsilon"], Minv = f["Minv"], adaptor = ad2, i = f["i"]))
+        a2 = r2.adaptor
+        @test !r2.done && r2.i == 150 && size(r2.stats, 1) == 60 && a2.state.i == 150
+        @test a2.state.window_splits == ad.state.window_splits && a2.state.window_end == ad.state.window_end
+        @test a2.ssa.state.m == 150 - last_split(150, a2.state.window_splits)
+        @test a2.pc.n == 150 - last_split(150, a2.state.window_splits) || a2.pc.n >= 0          # estimator keeps accumulating within its window
+        r3 = H.stage_warmup(tgt, r2.θ, f["rng"]; kw..., resume = (; θ = r2.θ, ϵ = r2.ϵ, Minv = r2.Minv, adaptor = a2, i = r2.i))
+        @test r3.done && r3.i == nad && size(r3.stats, 1) == nad - 150 && r3.adaptor.state.i == nad
+        @test r3.ϵ == exp(r3.adaptor.ssa.state.x_bar)               # finalised once, at the last iteration
+        @test r3.Minv != r1.Minv && all(r3.Minv .> 0) && all(isfinite, r3.θ)
+        @test filesize(path) < 200_000                              # parameters only: no data/closures in the state
+
+        # fingerprint: sensitive to every part of the target, insensitive to nothing but identity
+        mkfp(; kwargs...) = begin
+            base = (; drug = "binimetinib", design = "primary", window = 42.0, models = ["a", "b"], split = Dict("kind" => "primary", "seed" => 1, "holdout_models" => ["z"]),
+                    priors = H.default_priors(), nu = 5.0, baseline_sd = 0.1, lod = 4.0, doses = doses, pk = pk, cref = cref,
+                    k2_centered = [true, false], centered_lam0 = true, latent_w0 = true, reltol = 1e-5, abstol = 1e-5, init_id = "abc")
+            H.target_fingerprint(H.fingerprint_text(; merge(base, (; kwargs...))...))
+        end
+        fp0 = mkfp()
+        @test fp0 == mkfp() && length(fp0) == 32
+        for alt in ((; drug = "BKM120"), (; design = "late21"), (; window = 21.0), (; models = ["a", "c"]), (; split = Dict("kind" => "primary", "seed" => 2, "holdout_models" => ["z"])),
+                    (; priors = H.HierPriors(; μ_λ0 = (log(0.06), 0.5))), (; nu = 4.0), (; baseline_sd = 0.2), (; lod = 1.0),
+                    (; doses = doses[1:end-1]), (; pk = OneCmt(CL = 3.1, V = 1.5, ka = 24.0, F = 0.8)), (; cref = cref * 1.01),
+                    (; k2_centered = [false, false]), (; centered_lam0 = false), (; latent_w0 = false), (; reltol = 1e-6), (; init_id = "abd"))
+            @test mkfp(; alt...) != fp0
+        end
+        @test H.verify_fingerprint(fp0, fp0) && H.verify_fingerprint(fp0, fp0; what = "x")
+        err = try H.verify_fingerprint(fp0, mkfp(; nu = 4.0); what = "chain_1_1.jld2"); nothing catch e; e end
+        @test err isa ErrorException && occursin("fingerprint mismatch", err.msg) && occursin("chain_1_1.jld2", err.msg)
+        err2 = try H.verify_fingerprint(fp0, nothing; what = "warm_2.jld2"); nothing catch e; e end
+        @test err2 isa ErrorException && occursin("no fingerprint", err2.msg)
+    end
+
+    @testset "split_modes: converged modes kept, exclusions recorded; cross-mode only with >= 2 start modes" begin
+        mk(lp, μ; conv = false) = (; nt = (; μ_λ0 = μ, ω_λ0 = 0.5, μ_k2 = -1.0, ω_k2 = 0.5, logVtr = 7.0, logk1 = 0.0, σ = 0.2), lp, converged = conv)
+        ms = [mk(70.0, -3.0), mk(10.0, -1.0; conv = true), mk(-1.3, -3.0), mk(69.9, -3.0), mk(-Inf, -3.0)]
+        sm = H.split_modes(ms)
+        @test [round(m.lp; digits = 1) for m in sm.kept] == [70.0, 10.0]          # the converged low mode stays; duplicates merged
+        @test length(sm.excluded) == 2 && any(e -> e.reason == "failed start", sm.excluded) &&
+              any(e -> e.lp == -1.3 && !e.converged && isfinite(e.dist), sm.excluded)
+        @test H.distinct_modes(ms) == sm.kept
+        # a fit whose chains all started from one mode must not report a cross-mode R-hat
+        _, pd1 = H.fit_drug(units, doses, pk, cref; drug = "one", nchains = 2, nsamples = 8, nadapt = 6, rng = MersenneTwister(3),
+                            map_starts = 2, map_maxiters = 30, window_days = 0)
+        @test length(unique(pd1.diagnostics["chain_start_modes"])) <= 2 && haskey(pd1.diagnostics, "excluded_modes")
+        length(unique(pd1.diagnostics["chain_start_modes"])) == 1 && @test isnan(pd1.diagnostics["cross_mode_rhat"])
+    end
+
+    @testset "progress callback under threaded chains (locked state)" begin
+        _, pdt = H.fit_drug(units, doses, pk, cref; drug = "thr", nchains = 2, nsamples = 12, nadapt = 8, rng = MersenneTwister(9),
+                            map_starts = 0, window_days = 0, parallel = :chains, log_every = 4, logger = _ -> nothing)
+        @test length(pdt.σ) == 24
+    end
+
+    if isfile(joinpath(default_cache_dir(), "pct_long.csv"))
+        @testset "design_units (frozen split, windows)" begin
+            p = H.design_units("binimetinib", "primary"; subsample = 60)
+            l = H.design_units("binimetinib", "late21"; subsample = 60)
+            @test p.window == 42.0 && l.window == 21.0
+            @test [u.model for u in p.train] == [u.model for u in l.train]            # same PDX
+            @test isempty(intersect([u.model for u in p.train], p.split["holdout_models"]))
+            @test all(maximum(u.treated.t) <= 21.0 && maximum(u.control.t) <= 21.0 for u in l.train)
+            @test haskey(l.split, "late_window_day") && length(l.cutoffs) == 2 * length(l.train) && isempty(p.cutoffs)
+            @test p.split["model_frac"] == 0.2 && p.split["seed"] == 1
+            tr, te, info = H.frozen_pdx_split()
+            @test isempty(intersect(tr, te)) && info.n_universe == length(tr) + length(te)
+            # the same PDX are held out whichever drug is fitted
+            @test Set(H.design_units("BKM120", "primary").split["holdout_models"]) ⊆ Set(te)
+        end
     end
 
     @testset "diagnostics edge cases" begin

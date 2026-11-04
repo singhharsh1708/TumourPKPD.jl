@@ -7,7 +7,7 @@ Raw files are not redistributed here; `data/download.jl` fetches them from the S
 verifies SHA-256.
 
 ```
-julia --project=. data/download.jl     # raw xlsx + pdf -> ~/Work/tumour-pkpd/downloads/pdxe (or data/cache/raw)
+julia --project=. data/download.jl     # raw xlsx + pdf -> $TUMOURPKPD_RAW_DIR (default data/cache/raw)
 julia --project=. data/clean.jl        # -> data/cache/{pct_long,pct_metrics,treatment_audit}.csv   (~10 s)
 ```
 
