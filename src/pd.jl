@@ -39,15 +39,88 @@ dose_times(::NoDrug) = Float64[]
 Exposure e(t) = conc(pk, doses, t) / cref. `cref` sets the scale on which k2
 is reported (e.g. Cmax of the reference regimen), so k2 stays comparable
 across PK scenarios.
+
+Doses are sorted by time at construction. For `OneCmt` (oral and/or IV doses)
+e(t) is evaluated from a precomputed state at the last dose time ≤ t
+(two `exp` calls and a binary search per call, whatever the number of doses);
+other models, and near-equal absorption/elimination rates, use a sorted loop
+over the doses at or before t. Results agree with `conc(pk, doses, t) / cref`.
 """
-struct PKExposure{P<:PKModel,T<:Real}
+struct PKExposure{P<:PKModel,T<:Real,C}
     pk::P
-    doses::Vector{Dose}
+    doses::Vector{Dose}      # sorted by time
     cref::T
+    times::Vector{Float64}   # distinct dose times, sorted
+    cache::C                 # `nothing` or a _OneCmtState
+end
+function PKExposure(pk::PKModel, doses::AbstractVector{Dose}, cref::Real)
+    ds = sort(collect(Dose, doses); by = d -> d.time)
+    times = unique(d.time for d in ds)
+    return PKExposure(pk, ds, cref, times, _exposure_cache(pk, ds, times, cref))
 end
 PKExposure(pk, doses) = PKExposure(pk, doses, 1.0)
-(e::PKExposure)(t) = conc(e.pk, e.doses, t) / e.cref
-dose_times(e::PKExposure) = [d.time for d in e.doses]
+
+# One-compartment state after each distinct dose time tᵢ: for t in [tᵢ, tᵢ₊₁),
+#   e(t) = a[i] exp(-k (t - tᵢ)) + b[i] exp(-ka (t - tᵢ)),   divided by cref.
+struct _OneCmtState{T}
+    a::Vector{T}
+    b::Vector{T}
+    k::T
+    ka::T
+end
+
+_exposure_cache(pk, ds, times, cref) = nothing
+function _exposure_cache(pk::OneCmt, ds, times, cref)
+    k = pk.CL / pk.V
+    ka = pk.ka
+    # 1/(ka - k) amplifies rounding when the two rates nearly coincide: use the sorted loop there
+    any(d -> d.route === :oral, ds) && !(abs(ka - k) > 1e-3 * max(k, ka)) && return nothing
+    T = promote_type(typeof(k), typeof(ka), typeof(pk.F), typeof(float(cref)))
+    n = length(times)
+    a = zeros(T, n)
+    b = zeros(T, n)
+    ai = zero(T); bi = zero(T)
+    j = 1
+    for (i, ti) in enumerate(times)
+        if i > 1
+            Δ = ti - times[i-1]
+            ai *= exp(-k * Δ)
+            bi *= exp(-ka * Δ)
+        end
+        while j <= length(ds) && ds[j].time == ti
+            d = ds[j]
+            if d.route === :iv
+                ai += d.amt / pk.V
+            else
+                c0 = pk.F * d.amt * ka / (pk.V * (ka - k))
+                ai += c0
+                bi -= c0
+            end
+            j += 1
+        end
+        a[i] = ai / cref
+        b[i] = bi / cref
+    end
+    return _OneCmtState{T}(a, b, T(k), T(ka))
+end
+
+function (e::PKExposure{P,T,Nothing})(t) where {P,T}
+    c = zero(promote_type(typeof(e.pk.CL), typeof(float(t))))
+    for d in e.doses
+        τ = t - d.time
+        τ < 0 && break
+        c += d.amt * unit_conc(e.pk, d.route, τ)
+    end
+    return c / e.cref
+end
+function (e::PKExposure{P,T,<:_OneCmtState})(t) where {P,T}
+    s = e.cache
+    i = searchsortedlast(e.times, t)
+    i == 0 && return zero(s.k) * t
+    τ = t - e.times[i]
+    return s.a[i] * exp(-s.k * τ) + s.b[i] * exp(-s.ka * τ)
+end
+dose_times(e::PKExposure) = e.times
 
 # Smooth saturation factor 1 / (1 + r^ψ)^(1/ψ), computed in log space so large
 # tumours do not overflow.
