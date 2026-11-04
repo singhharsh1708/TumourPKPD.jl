@@ -392,8 +392,20 @@ struct PosteriorDraws
     logλ1::Vector{Float64}; logk1::Vector{Float64}; σ::Vector{Float64}
     λ0::Matrix{Float64}
     k2::Matrix{Float64}
-    w0_control::Vector{Float64}; w0_treated::Vector{Float64}
+    w0_control::Vector{Float64}; w0_treated::Vector{Float64}   # per model: posterior median (latent) or observed
+    w0_control_draws::Matrix{Float64}                           # ndraw × nmodel baselines per draw
+    w0_treated_draws::Matrix{Float64}                           # (constant columns when w0 is fixed)
     diagnostics::Dict{String,Any}
+end
+
+# Fixed-baseline constructor (old 16-field form): per-draw baselines repeat the fixed values.
+function PosteriorDraws(drug, models, doses, pk, cref, μ_λ0, ω_λ0, μ_k2, ω_k2, logλ1, logk1, σ,
+                        λ0, k2, w0_control, w0_treated, diagnostics)
+    S = size(λ0, 1)
+    wc = repeat(permutedims(collect(Float64, w0_control)), S, 1)
+    wt = repeat(permutedims(collect(Float64, w0_treated)), S, 1)
+    return PosteriorDraws(drug, models, doses, pk, cref, μ_λ0, ω_λ0, μ_k2, ω_k2, logλ1, logk1, σ,
+                          λ0, k2, w0_control, w0_treated, wc, wt, diagnostics)
 end
 
 "Save a `PosteriorDraws` to `path` (JLD2, key \"pd\")."
