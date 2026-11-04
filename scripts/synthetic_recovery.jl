@@ -30,12 +30,11 @@ nadapt     = length(POS) >= 4 ? parse(Int, POS[4]) : 300
 latent_w0  = length(POS) >= 5 ? parse(Bool, POS[5]) : true
 seed       = length(POS) >= 6 ? parse(Int, POS[6]) : 20261104
 tag        = length(POS) >= 7 ? POS[7] : "N$(N)"
-# optional tighter prior on logλ1 sd (default 0.9, see HierPriors)
-l1sd       = length(POS) >= 8 ? parse(Float64, POS[8]) : 0.9
-l1mu       = length(POS) >= 9 ? parse(Float64, POS[9]) : log(300.0)
-PRIORS     = H.HierPriors(; logλ1 = (l1mu, l1sd))
+PRIORS     = H.default_priors()
+CTHREADS   = let f = filter(a -> startswith(a, "--cthreads="), FLAGS); isempty(f) ? 1 : parse(Int, split(f[1], '=')[2]) end
+INIT_FILE  = let f = filter(a -> startswith(a, "--init-file="), FLAGS); isempty(f) ? "" : split(f[1], '=')[2] end
 
-CHILD > 0 || println("# synthetic recovery  logλ1 prior N($(round(l1mu; digits=3)), $(l1sd))  N=$N chains=$nchains samples=$nsamples adapt=$nadapt latent_w0=$latent_w0 seed=$seed threads=$(Threads.nthreads())")
+CHILD > 0 || println("# synthetic recovery  Vtr prior N(log 1000, 0.7), Student-t nu=5, baseline sd 0.1  N=$N chains=$nchains samples=$nsamples adapt=$nadapt latent_w0=$latent_w0 seed=$seed threads=$(Threads.nthreads())")
 
 # --- truth ---------------------------------------------------------------------------------
 # mouse-like PK in per-day units: k = CL/V = 2/day (t1/2 ≈ 8 h), fast absorption; daily oral dosing 28 days.
@@ -55,8 +54,11 @@ CHILD > 0 || println("final control volume (median, max): ",
         round(median(last(u.control.v) for u in units); digits = 0), " ", round(maximum(last(u.control.v) for u in units); digits = 0))
 
 if CHILD > 0                                      # child process: sample one chain, save, exit
-    chain, _ = H.fit_drug(units, doses, pk, cref; nchains = 1, nsamples, nadapt, chain_only = true,
-                          rng = MersenneTwister(1000 * seed + CHILD), latent_w0, priors = PRIORS, log_every = 250)
+    init, k2c = isempty(INIT_FILE) ? (nothing, nothing) : load_init(INIT_FILE)
+    chain, _ = H.fit_drug(units, doses, pk, cref; nchains = 1, nsamples, nadapt, chain_only = true, init, k2_centered = k2c,
+                          map_starts = 0, window_days = 0,
+                          rng = MersenneTwister(1000 * seed + CHILD), latent_w0, priors = PRIORS, log_every = 25,
+                          logger = m -> (println("[chain $CHILD] ", m); flush(stdout)))
     save_chain_parts(CHILD_OUT, chain)
     println("[chain $CHILD] saved"); flush(stdout)
     exit(0)
@@ -93,24 +95,32 @@ end
 
 # --- fit -------------------------------------------------------------------------------------
 println("\n## fit")
-fitkw = (; drug = "synthetic_$(tag)", nsamples, nadapt, latent_w0, progress = false, priors = PRIORS, seed)
+fitkw = (; drug = "synthetic_$(tag)", nsamples, nadapt, latent_w0, progress = false, priors = PRIORS, seed, window_days = 0)
 if nchains > 1 && Threads.nthreads() > 1 && !NOPROCS
-    println("sampling $nchains chains in separate processes (max $(Threads.nthreads()) at a time)")
-    chain_, wall = run_chain_procs(@__FILE__, POS, nchains; maxprocs = Threads.nthreads(), project = Base.active_project())
-    chain, pd = H.fit_drug(units, doses, pk, cref; fitkw..., precomputed_chain = chain_, precomputed_runtime = wall)
+    println("multi-start MAP (5 starts) in the parent, then $nchains chains in separate processes"); flush(stdout)
+    nt0, map_lps, _, k2c = H.map_init(units, doses, pk, cref; window_days = 0, latent_w0, priors = PRIORS, nstarts = 5,
+                                 maxiters = 1000, rng = MersenneTwister(seed + 2))
+    println("MAP log-densities of the starts: ", round.(map_lps; digits = 1)); flush(stdout)
+    init_file = joinpath(mktempdir(), "init.jld2"); save_init(init_file, nt0, k2c)
+    maxprocs = max(1, Threads.nthreads() ÷ CTHREADS)
+    println("sampling: $CTHREADS thread(s) per chain process, max $maxprocs at a time"); flush(stdout)
+    chain_, wall = run_chain_procs(@__FILE__, vcat(POS, ["--cthreads=$CTHREADS", "--init-file=$init_file"]), nchains;
+                                   maxprocs, threads = CTHREADS, project = Base.active_project())
+    chain, pd = H.fit_drug(units, doses, pk, cref; fitkw..., precomputed_chain = chain_, precomputed_runtime = wall, map_lps, k2_centered = k2c)
 else
-    chain, pd = H.fit_drug(units, doses, pk, cref; fitkw..., nchains, rng = MersenneTwister(seed + 1), log_every = 200)
+    chain, pd = H.fit_drug(units, doses, pk, cref; fitkw..., nchains, rng = MersenneTwister(seed + 1), log_every = 25)
 end
 diag = pd.diagnostics
 niter = nchains * (nsamples + nadapt)
 @printf("runtime %.1f s  (%d iterations total -> %.1f s per 100 iterations)\n",
         diag["runtime_s"], niter, 100 * diag["runtime_s"] / niter)
 println("parallel mode: ", diag["settings"]["parallel"], "  chunksize ", diag["settings"]["chunksize"])
-for k in ("max_rhat", "min_ess_bulk", "n_divergences", "mean_acceptance", "mean_tree_depth",
+println("MAP log-densities (mode multiplicity): ", round.(diag["map_lps"]; digits = 1))
+for k in ("max_rhat", "min_ess_bulk", "n_divergences", "mean_acceptance", "mean_tree_depth", "mean_n_steps",
           "max_tree_depth_hits", "mean_step_size")
     println(rpad(k, 22), diag[k])
 end
-H.save_fit(joinpath(homedir(), "Work/tumour-pkpd/logs/2026-11-04-p2-inference-synth-$(tag).jld2"), pd)
+H.save_fit(joinpath(homedir(), "Work/tumour-pkpd/logs/2026-11-04-p3-inference-synth-$(tag).jld2"), pd)
 
 # --- recovery table ----------------------------------------------------------------------------
 q(x) = (quantile(x, 0.05), median(x), quantile(x, 0.95))
@@ -124,9 +134,11 @@ println("\n## population parameters (log scale; omega/sigma natural scale)")
 println("param        true    median        90% CrI           in CrI")
 res = [row("μ_λ0", truth.μ_λ0, pd.μ_λ0), row("ω_λ0", truth.ω_λ0, pd.ω_λ0),
        row("μ_k2", truth.μ_k2, pd.μ_k2), row("ω_k2", truth.ω_k2, pd.ω_k2),
-       row("logλ1", truth.logλ1, pd.logλ1), row("logk1", truth.logk1, pd.logk1),
+       row("logλ1", truth.logλ1, pd.logλ1), row("log Vtr", truth.logλ1 - truth.μ_λ0, pd.logλ1 .- pd.μ_λ0),
+       row("logk1", truth.logk1, pd.logk1),
        row("σ", truth.σ, pd.σ)]
 println("population params inside 90% CrI: $(sum(res))/$(length(res))")
+println("posterior sd / prior sd of logk1: ", round(std(pd.logk1) / PRIORS.logk1[2]; digits = 2))
 
 println("\n## per-unit coverage (90% CrI)")
 for (nm, post, tv) in (("λ0", pd.λ0, tru.λ0), ("k2", pd.k2, tru.k2))

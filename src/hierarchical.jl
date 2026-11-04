@@ -5,9 +5,9 @@
 #
 # Unit = PDX model; each has a control curve (NoDrug) and a treated curve (PKExposure).
 #
-#   logλ0_i = μ_λ0 + ω_λ0 z_λ0_i          (shared by control and treated arm of unit i)
+#   logλ0_i ~ N(μ_λ0, ω_λ0)  (sampled centred; or μ_λ0 + ω_λ0 z_λ0_i non-centred)  shared by both arms of unit i
 #   logk2_i = μ_k2 + ω_k2 z_k2_i
-#   logλ1, logk1, σ                        drug level / pooled
+#   logVtr (λ1 = exp(μ_λ0)·Vtr), logk1, σ  drug level / pooled
 #   w0 per curve: fixed at the observed day-0 volume (default) or latent, see `latent_w0`
 #   log v_ij ~ Normal(log w_i(t_ij), σ)    v > 0
 #   v_ij == 0 -> left-censored: P(log w + σ ε < log LOD) = Φ((log LOD - log w)/σ)
@@ -21,8 +21,11 @@ using JLD2
 using MCMCChains
 using Random, Statistics
 using LogExpFunctions: logsumexp
+import Optim
+const DynamicPPL = Turing.DynamicPPL
+const LogDensityProblems = Turing.LogDensityProblems
 
-export PosteriorDraws, chain_to_parts, chain_from_parts, valid_baseline, prepare_units, cache_stats, save_fit, load_fit, fit_drug, pointwise_loglik, pointwise_index,
+export PosteriorDraws, frozen_pdx_split, window_units, map_init, multistart_map, chain_to_parts, chain_from_parts, valid_baseline, prepare_units, cache_stats, save_fit, load_fit, fit_drug, pointwise_loglik, pointwise_index,
        grouped_loglik, HierPriors, default_priors, hier_model, prepare_data,
        population_loglik, simulate_units, reference_cref, SynthUnit, SynthCurve, marginal_unit_loglik
 
@@ -40,16 +43,16 @@ inference report for the justification of every number.
 - `ω_λ0 ~ HalfNormal(s)`           between-PDX sd of logλ0
 - `μ_k2 ~ Normal(m, s)`            log potency on cref-normalised exposure (1/day)
 - `ω_k2 ~ HalfNormal(s)`
-- `logλ1 ~ Normal(m, s)`           log linear growth rate (mm^3/day)
+- `logVtr ~ Normal(m, s)`          log transition volume (mm^3); λ1 = exp(μ_λ0) · Vtr  (log λ1 = μ_λ0 + logVtr)
 - `logk1 ~ Normal(m, s)`           log transit rate (1/day)
 - `σ ~ HalfNormal(s)`              log-volume residual sd
 """
 Base.@kwdef struct HierPriors
-    μ_λ0::NTuple{2,Float64} = (log(0.12), 0.7)
+    μ_λ0::NTuple{2,Float64} = (log(0.06), 0.5)    # PDXE controls: median log-slope ~0.05/day in the 42-day window
     ω_λ0::Float64 = 0.5
     μ_k2::NTuple{2,Float64} = (log(0.15), 1.3)
     ω_k2::Float64 = 1.0
-    logλ1::NTuple{2,Float64} = (log(300.0), 0.9)
+    logVtr::NTuple{2,Float64} = (log(1000.0), 0.7)
     logk1::NTuple{2,Float64} = (log(0.7), 0.6)
     σ::Float64 = 0.3
 end
@@ -181,11 +184,18 @@ struct HierData{E,S}
     latent_w0::Bool
     local_grad::Bool
     threaded::Bool
+    nu::Float64                      # Student-t degrees of freedom of the log-volume residuals (Inf = Normal)
+    baseline_sd::Float64             # fixed sd of log w0 around log v0 (latent baselines)
+    centered_lam0::Bool              # sample logλ0_i directly (centred) instead of via z (non-centred)
+    k2_centered::Vector{Bool}        # per unit: sample logk2_i directly (centred) instead of via z (non-centred)
     token::Base.RefValue{Int}        # identity key for the task-local caches
     dropped::Vector{String}          # units removed for an invalid day-0 volume
 end
-HierData(units, expo, lod, solver, latent_w0, local_grad, threaded, dropped = String[]) =
-    HierData(units, expo, lod, solver, latent_w0, local_grad, threaded, Ref(rand(Int)), dropped)
+HierData(units, expo, lod, solver, latent_w0, local_grad, threaded;
+         nu = 5.0, baseline_sd = 0.1, centered_lam0 = true, k2_centered = falses(length(units)),
+         dropped = String[]) =
+    HierData(units, expo, lod, solver, latent_w0, local_grad, threaded, float(nu), float(baseline_sd),
+             centered_lam0, collect(Bool, k2_centered), Ref(rand(Int)), dropped)
 
 # One cache per (HierData, task): chains running in separate tasks never evict each other's entry
 # and no lock is needed. The cache lives in task_local_storage.
@@ -194,19 +204,46 @@ _local_cache(d::HierData) = get!(LocalGradCache, task_local_storage(), (:tumourp
 cache_stats(d::HierData) = (c = _local_cache(d); (c.hits, c.misses))
 
 function prepare_data(units, doses, pk, cref; lod = _default_lod(), solver = SolverCfg(),
-                      latent_w0 = true, local_grad = true, threaded = true)
+                      latent_w0 = true, local_grad = true, threaded = true, nu = 5.0, baseline_sd = 0.1,
+                      centered_lam0 = true, k2_centered = nothing)
     ud, dropped = prepare_units(units; lod)
     isempty(ud) && throw(ArgumentError("no units with valid baselines"))
     expo = make_exposure(pk, doses, cref)
-    return HierData(ud, expo, float(lod), solver, latent_w0, local_grad, threaded, dropped)
+    kc = k2_centered === nothing ? falses(length(ud)) : k2_centered
+    length(kc) == length(ud) || throw(ArgumentError("k2_centered must have one entry per kept unit ($(length(ud)))"))
+    return HierData(ud, expo, float(lod), solver, latent_w0, local_grad, threaded; nu, baseline_sd, centered_lam0,
+                    k2_centered = kc, dropped)
 end
 
 @inline _lognormpdf(y, μ, σ) = -0.5 * ((y - μ) / σ)^2 - log(σ) - 0.9189385332046727
 
+# Student-t location-scale log density / log CDF (ν = Inf -> Normal). The t log-CDF has no ForwardDiff
+# rule, so it gets one: d/dx log F(x) = f(x) / F(x).
+@inline function _t_logpdf(y, μ, σ, ν)
+    isinf(ν) && return _lognormpdf(y, μ, σ)
+    z = (y - μ) / σ
+    return _tconst(ν) - 0.5 * (ν + 1) * log1p(z^2 / ν) - log(σ)
+end
+_tconst(ν) = logpdf(TDist(ν), 0.0)
+_tlogcdf(x::Real, ν) = logcdf(TDist(ν), x)
+function _tlogcdf(x::ForwardDiff.Dual{T}, ν) where {T}
+    v = ForwardDiff.value(x)
+    lc = logcdf(TDist(ν), v)
+    slope = isfinite(lc) ? exp(logpdf(TDist(ν), v) - lc) : zero(lc)
+    return ForwardDiff.Dual{T}(lc, slope * ForwardDiff.partials(x))
+end
+@inline _t_logcdf(x, μ, σ, ν) = isinf(ν) ? logcdf(Normal(μ, σ), x) : _tlogcdf((x - μ) / σ, ν)
+
 # Log-likelihood of one curve. Returns -Inf if the ODE solve fails.
 # `pointwise` (optional Vector) receives per-observation contributions.
+# Residuals: log v ~ Student-t(ν, log w, σ); v = 0 is left-censored: P(log v_obs < log LOD).
+# Predicted volume is floored at 1e-3 mm^3 (far below the 4 mm^3 LOD): eradicated tumours can give
+# w ~ -2e-7 with a successful solve, and the log of a non-positive number is undefined. The floor makes
+# the likelihood flat in w below 1e-3 mm^3 (a kink, but only in a region where every observation is
+# censored or hugely penalised).
+const W_FLOOR = 1e-3
 function curve_loglik(c::CurveData, λ0, λ1, k1, k2, logw0, σ, expo, lod, cfg::SolverCfg;
-                      pointwise = nothing)
+                      pointwise = nothing, nu = 5.0)
     isempty(c.t) && return zero(promote_type(typeof(λ0), typeof(σ)))
     θ = Simeoni(λ0, λ1, k1, k2, exp(logw0))
     w, ok = simulate_tumour(θ, expo, c.t; solver = cfg.solver, reltol = cfg.reltol, abstol = cfg.abstol)
@@ -215,8 +252,8 @@ function curve_loglik(c::CurveData, λ0, λ1, k1, k2, logw0, σ, expo, lod, cfg:
     logLOD = log(lod)
     s = zero(T)
     for j in eachindex(c.t)
-        lw = log(max(w[j], 1e-3))   # floor far below the LOD; eradicated tumours can give w ~ -2e-7
-        l = c.cens[j] ? logcdf(Normal(lw, σ), logLOD) : _lognormpdf(c.logv[j], lw, σ)
+        lw = log(max(w[j], W_FLOOR))
+        l = c.cens[j] ? _t_logcdf(logLOD, lw, σ, nu) : _t_logpdf(c.logv[j], lw, σ, nu)
         pointwise === nothing || (pointwise[j] = ForwardDiff.value(l))
         s += l
     end
@@ -226,11 +263,11 @@ end
 # Control arm: no drug, k1/k2 irrelevant.
 @inline control_loglik(u::UnitData, llam0, llam1, σ, lw0, d::HierData) =
     curve_loglik(u.control, exp(llam0), exp(llam1), one(llam0), zero(llam0), lw0, σ,
-                 NoDrug(), d.lod, d.solver)
+                 NoDrug(), d.lod, d.solver; nu = d.nu)
 
 @inline treated_loglik(u::UnitData, llam0, llam1, lk1, lk2, σ, lw0, d::HierData) =
     curve_loglik(u.treated, exp(llam0), exp(llam1), exp(lk1), exp(lk2), lw0, σ,
-                 d.exposure, d.lod, d.solver)
+                 d.exposure, d.lod, d.solver; nu = d.nu)
 
 # --- value + gradient by local forward-mode (no dependence on outer AD) -----------------
 
@@ -242,8 +279,13 @@ struct LocalTag end
     end
 end
 
+# Test hook: when set, every locally seeded (dual) arm evaluation reports a failed solve (value -Inf,
+# zero partials), to exercise the "Float64 solve fine, dual solve failed" rejection path.
+const _FAULT_DUAL = Ref(false)
+
 @inline function _valgrad(f, x::NTuple{K,Float64}) where {K}
     r = f(_seed(x)...)
+    _FAULT_DUAL[] && return (-Inf, ntuple(_ -> 0.0, Val(K)))
     r isa ForwardDiff.Dual || return (Float64(r), ntuple(_ -> 0.0, Val(K)))
     return (ForwardDiff.value(r), ForwardDiff.partials(r).values)
 end
@@ -266,16 +308,19 @@ function unit_valgrad(u::UnitData, p::NTuple{7,Float64}, d::HierData)
     v = unit_loglik(u, llam0, lk2, llam1, lk1, σ, lw0c, lw0t, d)
     isfinite(v) || return (-Inf, zero7)
     if d.latent_w0
-        _, gc = _valgrad((a, b, c, w) -> control_loglik(u, a, b, c, w, d), (llam0, llam1, σ, lw0c))
-        _, gt = _valgrad((a, b, c, e, f, w) -> treated_loglik(u, a, b, c, e, f, w, d),
-                         (llam0, llam1, lk1, lk2, σ, lw0t))
+        vc, gc = _valgrad((a, b, c, w) -> control_loglik(u, a, b, c, w, d), (llam0, llam1, σ, lw0c))
+        vt, gt = _valgrad((a, b, c, e, f, w) -> treated_loglik(u, a, b, c, e, f, w, d),
+                          (llam0, llam1, lk1, lk2, σ, lw0t))
         g = (gc[1] + gt[1], gt[4], gc[2] + gt[2], gt[3], gc[3] + gt[5], gc[4], gt[6])
     else
-        _, gc = _valgrad((a, b, c) -> control_loglik(u, a, b, c, lw0c, d), (llam0, llam1, σ))
-        _, gt = _valgrad((a, b, c, e, f) -> treated_loglik(u, a, b, c, e, f, lw0t, d),
-                         (llam0, llam1, lk1, lk2, σ))
+        vc, gc = _valgrad((a, b, c) -> control_loglik(u, a, b, c, lw0c, d), (llam0, llam1, σ))
+        vt, gt = _valgrad((a, b, c, e, f) -> treated_loglik(u, a, b, c, e, f, lw0t, d),
+                          (llam0, llam1, lk1, lk2, σ))
         g = (gc[1] + gt[1], gt[4], gc[2] + gt[2], gt[3], gc[3] + gt[5], 0.0, 0.0)
     end
+    # a failed dual solve returns Dual(-Inf) with zero partials: its "gradient" is meaningless, so the
+    # dual arm values must be finite before the gradients are accepted
+    (isfinite(vc) && isfinite(vt)) || return (-Inf, zero7)
     all(isfinite, g) || return (-Inf, zero7)
     return (v, g)
 end
@@ -380,25 +425,51 @@ end
 # Turing model
 # ---------------------------------------------------------------------------------------
 
+# index of unit i inside its own group (centred / non-centred)
+function _k2_positions(mask::AbstractVector{Bool})
+    pos = zeros(Int, length(mask)); a = 0; b = 0
+    for i in eachindex(mask)
+        mask[i] ? (a += 1; pos[i] = a) : (b += 1; pos[i] = b)
+    end
+    return pos
+end
+
 @model function hier_model(d::HierData, pri::HierPriors)
     N = length(d.units)
     μ_λ0 ~ Normal(pri.μ_λ0...)
     ω_λ0 ~ truncated(Normal(0.0, pri.ω_λ0); lower = 0.0)
     μ_k2 ~ Normal(pri.μ_k2...)
     ω_k2 ~ truncated(Normal(0.0, pri.ω_k2); lower = 0.0)
-    logλ1 ~ Normal(pri.logλ1...)
+    logVtr ~ Normal(pri.logVtr...)
+    logλ1 = μ_λ0 + logVtr                      # λ1 = exp(μ_λ0) · Vtr: transition volume Vtr = λ1/λ0
     logk1 ~ Normal(pri.logk1...)
     σ ~ truncated(Normal(0.0, pri.σ); lower = 0.0)
-    z_λ0 ~ filldist(Normal(), N)
-    z_k2 ~ filldist(Normal(), N)
-    llam0 = μ_λ0 .+ ω_λ0 .* z_λ0
-    lk2 = μ_k2 .+ ω_k2 .* z_k2
+    # λ0 is strongly identified by each unit's control curve (and shared by its treated arm), so it is sampled
+    # CENTRED: with data this informative the non-centred z_i has a posterior sd of ~0.01-0.05 against a N(0,1)
+    # prior and forces NUTS step sizes of that size. k2 is only weakly identified for non-responders (upper
+    # bound) and eradicated tumours (lower bound), so it stays non-centred.
+    if d.centered_lam0
+        llam0 ~ filldist(Normal(μ_λ0, ω_λ0), N)
+    else
+        z_λ0 ~ filldist(Normal(), N)
+        llam0 = μ_λ0 .+ ω_λ0 .* z_λ0
+    end
+    nc = count(d.k2_centered)
+    if nc > 0
+        lk2c ~ filldist(Normal(μ_k2, ω_k2), nc)           # well-identified potencies: centred
+    end
+    if nc < N
+        z_k2 ~ filldist(Normal(), N - nc)                 # weakly identified (non-responders, eradicated): non-centred
+    end
+    kpos = _k2_positions(d.k2_centered)
+    lk2 = [d.k2_centered[i] ? lk2c[kpos[i]] : μ_k2 + ω_k2 * z_k2[kpos[i]] for i in 1:N]
     if d.latent_w0
-        # Flat prior on log w0 plus the single day-0 observation  =>  logw0 = log v0 + σ z (non-centred).
+        # Flat prior on log w0 plus the single day-0 observation measured with a FIXED error sd τ
+        # (`baseline_sd`, ~ caliper measurement error)  =>  logw0 = log v0 + τ z (non-centred).
         z_w0c ~ filldist(Normal(), N)
         z_w0t ~ filldist(Normal(), N)
-        lw0c = [log(u.control.v0) for u in d.units] .+ σ .* z_w0c
-        lw0t = [log(u.treated.v0) for u in d.units] .+ σ .* z_w0t
+        lw0c = [log(u.control.v0) for u in d.units] .+ d.baseline_sd .* z_w0c
+        lw0t = [log(u.treated.v0) for u in d.units] .+ d.baseline_sd .* z_w0t
     else
         lw0c = [log(u.control.v0) for u in d.units]
         lw0t = [log(u.treated.v0) for u in d.units]
@@ -467,20 +538,240 @@ function initial_values(d::HierData, pri::HierPriors, rng::AbstractRNG; jitter =
     N = length(d.units)
     sl = filter(x -> isfinite(x) && x > 0.005, _control_slope.(d.units))
     μ0 = isempty(sl) ? pri.μ_λ0[1] : clamp(log(median(sl)), log(0.02), log(0.8))
+    sl_all = _control_slope.(d.units)
+    ll0 = [isfinite(x) && x > 0.005 ? clamp(log(x), log(0.01), log(1.0)) : μ0 for x in sl_all]
     nt = (; μ_λ0 = μ0 + jitter * randn(rng), ω_λ0 = 0.3 * exp(jitter * randn(rng)),
           μ_k2 = pri.μ_k2[1] + jitter * randn(rng), ω_k2 = 0.5 * exp(jitter * randn(rng)),
-          logλ1 = pri.logλ1[1] + jitter * randn(rng), logk1 = pri.logk1[1] + jitter * randn(rng),
-          σ = 0.25 * exp(jitter * randn(rng)),
-          z_λ0 = jitter .* randn(rng, N), z_k2 = jitter .* randn(rng, N))
+          logVtr = pri.logVtr[1] + jitter * randn(rng), logk1 = pri.logk1[1] + jitter * randn(rng),
+          σ = 0.25 * exp(jitter * randn(rng)), z_k2 = jitter .* randn(rng, N))
+    nt = d.centered_lam0 ? merge(nt, (; llam0 = ll0 .+ jitter .* randn(rng, N))) :
+                           merge(nt, (; z_λ0 = jitter .* randn(rng, N)))
     if d.latent_w0
         nt = merge(nt, (; z_w0c = jitter .* randn(rng, N), z_w0t = jitter .* randn(rng, N)))
     end
-    return nt
+    return apply_k2_mask(nt, d.k2_centered)
 end
 
 # ---------------------------------------------------------------------------------------
 # fit_drug
 # ---------------------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------------------
+# Frozen whole-PDX split shared by all drugs
+# ---------------------------------------------------------------------------------------
+
+"""
+    frozen_pdx_split(drugs=list_drugs(); frac=0.2, seed=1, dir=default_cache_dir()) -> (train_ids, test_ids, info)
+
+One stratified whole-PDX split (`split_models`, stratified by tumour type) computed on the UNION of the PDX models that have a
+paired control/treated curve for any of `drugs`, so the same PDX identities are held out for every drug (controls are shared
+per PDX). A drug's own holdout is `test_ids ∩ its models`. Deterministic in (frac, seed, set of models); independent of
+input order. `info` records the universe for the saved metadata.
+"""
+function frozen_pdx_split(drugs = list_drugs(); frac::Real = 0.2, seed::Integer = 1, dir = default_cache_dir())
+    uni = Dict{String,String}()
+    for dr in drugs
+        for u in drug_dataset(dr; dir)
+            uni[String(u.model)] = String(u.tumour_type)
+        end
+    end
+    ids = sort(collect(keys(uni)))
+    train, test = split_models([(; model = m, tumour_type = uni[m]) for m in ids]; frac, seed)
+    return train, test, (; drugs = collect(String.(drugs)), n_universe = length(ids), frac = float(frac), seed = Int(seed))
+end
+
+# ---------------------------------------------------------------------------------------
+# Fit window
+# ---------------------------------------------------------------------------------------
+
+"Truncate a curve (any struct with model, tumour_type, treatment, t, v) to observations with t <= window."
+function truncate_curve(c, window::Real)
+    m = [t <= window for t in c.t]
+    return typeof(c)(c.model, c.tumour_type, c.treatment, c.t[m], c.v[m])
+end
+
+"""
+    window_units(units, window_days) -> units
+
+Prespecified fit window: keep only observations with day <= `window_days` in both arms of every unit
+(`window_days <= 0` or `Inf` = full follow-up, returns `units` unchanged). Apply BEFORE any late/holdout split.
+"""
+function window_units(units, window_days::Real)
+    (window_days <= 0 || isinf(window_days)) && return units
+    return [typeof(u)(u.model, u.tumour_type, truncate_curve(u.control, window_days),
+                      truncate_curve(u.treated, window_days)) for u in units]
+end
+
+"""
+    apply_k2_mask(nt, mask) -> NamedTuple
+
+Re-express a fully non-centred start (`z_k2` of length N) for a model whose units in `mask` have centred potency:
+`lk2c = μ_k2 + ω_k2 z_k2[mask]`, `z_k2 = z_k2[.!mask]`.
+"""
+function apply_k2_mask(nt::NamedTuple, mask::AbstractVector{Bool})
+    any(mask) || return nt
+    haskey(nt, :z_k2) || return nt
+    length(nt.z_k2) == length(mask) || return nt        # already converted
+    rest = Base.structdiff(nt, (; z_k2 = nothing))
+    out = merge(rest, (; lk2c = nt.μ_k2 .+ nt.ω_k2 .* nt.z_k2[mask]))
+    all(mask) || (out = merge(out, (; z_k2 = nt.z_k2[.!mask])))
+    return out
+end
+
+"""
+    choose_k2_centering(model, nt; sd_threshold=0.3, chunksize=32) -> Vector{Bool}
+
+Parameterisation choice (it does not change the target density): at a mode `nt` of the NON-centred model, the
+conditional posterior sd of each z_k2_i is 1/sqrt(-∂²log p/∂z_k2_i²). Where the data pin it far tighter than its N(0,1)
+prior (sd < `sd_threshold`) a non-centred z creates a very narrow, μ_k2/ω_k2-coupled direction (this is what forces NUTS
+step sizes of ~0.005 on the real binimetinib data), so those units are sampled centred; weakly identified ones stay
+non-centred.
+"""
+function choose_k2_centering(model, nt::NamedTuple; sd_threshold::Real = 0.3, chunksize = 32)
+    N = length(nt.z_k2)
+    adtype = AutoForwardDiff(; chunksize)
+    vi = DynamicPPL.VarInfo(Random.MersenneTwister(0), model)
+    vi = DynamicPPL.link(DynamicPPL.initialize_parameters!!(vi, nt, model), model)
+    ldf = DynamicPPL.LogDensityFunction(model, DynamicPPL.getlogjoint_internal, vi; adtype)
+    x = copy(vi[:])
+    # offset of z_k2 in the flattened (linked) vector: parameters are stored in model order
+    offs = 0
+    for k in keys(DynamicPPL.values_as(vi, NamedTuple))
+        k === :z_k2 && break
+        offs += length(nt[k])
+    end
+    mask = falses(N)
+    h = 1e-3
+    for i in 1:N
+        j = offs + i
+        e = zeros(length(x)); e[j] = h
+        gp = LogDensityProblems.logdensity_and_gradient(ldf, x .+ e)[2][j]
+        gm = LogDensityProblems.logdensity_and_gradient(ldf, x .- e)[2][j]
+        hii = (gp - gm) / (2h)
+        sd = hii < 0 ? 1 / sqrt(-hii) : Inf
+        mask[i] = sd < sd_threshold
+    end
+    return collect(Bool, mask)
+end
+
+# ---------------------------------------------------------------------------------------
+# Multi-start MAP of the sampling target (with the unconstrained-space Jacobian, so the hierarchical
+# sds are not driven to the boundary the way a Jacobian-free MAP is)
+# ---------------------------------------------------------------------------------------
+
+"""
+    multistart_map(model, d, priors, rng; nstarts=5, maxiters=1000, chunksize, logger=nothing) -> Vector
+
+Runs L-BFGS on log p(θ) (+ log-Jacobian, i.e. exactly the log density NUTS samples) from `nstarts` starting
+points: start 1 is the data-driven start, the others are drawn from the prior (z effects ~ N(0, 0.5²)).
+Returns one NamedTuple per start `(; nt, lp, iters, converged, start)` with `nt` the constrained parameter
+values (usable as `init`). Failed starts have `lp = -Inf`.
+"""
+function multistart_map(model, d::HierData, priors::HierPriors, rng::AbstractRNG; nstarts::Integer = 5,
+                        maxiters::Integer = 1000, chunksize = 32, logger = nothing)
+    out = NamedTuple[]
+    for k in 1:nstarts
+        nt0 = k == 1 ? initial_values(d, priors, rng; jitter = 0.0) : prior_start(d, priors, rng)
+        t0 = time()
+        r = try
+            find_mode(model, nt0; maxiters, chunksize)
+        catch err
+            (; nt = nt0, lp = -Inf, iters = 0, converged = false)
+        end
+        msg = "  [map] start $k/$nstarts: lp = $(round(r.lp; digits = 2)), $(r.iters) iterations, $(round(time() - t0; digits = 1)) s"
+        logger === nothing ? (println(msg); flush(stdout)) : logger(msg)
+        push!(out, (; r..., start = k))
+    end
+    return out
+end
+
+function find_mode(model, nt0; maxiters = 1000, chunksize = 32)
+    adtype = AutoForwardDiff(; chunksize)
+    vi = DynamicPPL.VarInfo(Random.MersenneTwister(0), model)
+    vi = DynamicPPL.initialize_parameters!!(vi, nt0, model)
+    vi = DynamicPPL.link(vi, model)
+    ldf = DynamicPPL.LogDensityFunction(model, DynamicPPL.getlogjoint_internal, vi; adtype)
+    f(x) = (lp = LogDensityProblems.logdensity(ldf, x); isfinite(lp) ? -lp : 1e30)
+    function g!(G, x)
+        lp, gr = LogDensityProblems.logdensity_and_gradient(ldf, x)
+        G .= isfinite(lp) ? -gr : 0.0
+        return nothing
+    end
+    res = Optim.optimize(f, g!, copy(vi[:]), Optim.LBFGS(), Optim.Options(iterations = maxiters, g_tol = 1e-3))
+    x = Optim.minimizer(res)
+    vi2 = DynamicPPL.invlink(DynamicPPL.unflatten(vi, x), model)
+    nt = DynamicPPL.values_as(vi2, NamedTuple)
+    return (; nt, lp = -Optim.minimum(res), iters = Optim.iterations(res), converged = Optim.converged(res))
+end
+
+function prior_start(d::HierData, pri::HierPriors, rng::AbstractRNG)
+    N = length(d.units)
+    nt = (; μ_λ0 = pri.μ_λ0[1] + pri.μ_λ0[2] * randn(rng), ω_λ0 = 0.05 + abs(pri.ω_λ0 * randn(rng)),
+          μ_k2 = pri.μ_k2[1] + pri.μ_k2[2] * randn(rng), ω_k2 = 0.05 + abs(pri.ω_k2 * randn(rng)),
+          logVtr = pri.logVtr[1] + pri.logVtr[2] * randn(rng), logk1 = pri.logk1[1] + pri.logk1[2] * randn(rng),
+          σ = 0.05 + abs(pri.σ * randn(rng)), z_k2 = 0.5 .* randn(rng, N))
+    nt = d.centered_lam0 ? merge(nt, (; llam0 = nt.μ_λ0 .+ nt.ω_λ0 .* randn(rng, N))) :
+                           merge(nt, (; z_λ0 = 0.5 .* randn(rng, N)))
+    d.latent_w0 && (nt = merge(nt, (; z_w0c = 0.5 .* randn(rng, N), z_w0t = 0.5 .* randn(rng, N))))
+    return apply_k2_mask(nt, d.k2_centered)
+end
+
+const _POSITIVE_PARAMS = (:ω_λ0, :ω_k2, :σ)
+
+"Small random perturbation of a constrained start `nt` (scales stay positive)."
+function jitter_init(nt::NamedTuple, rng::AbstractRNG, s::Real)
+    s == 0 && return nt
+    vals = map(keys(nt)) do k
+        v = nt[k]
+        if k in _POSITIVE_PARAMS
+            max(v, 1e-3) * exp(s * randn(rng))
+        elseif v isa Real
+            v + s * randn(rng)
+        else
+            v .+ s .* randn(rng, length(v))
+        end
+    end
+    return NamedTuple{keys(nt)}(Tuple(vals))
+end
+
+"""
+    map_init(units, doses, pk, cref; kwargs...) -> (nt, lps, modes)
+
+Multi-start MAP only (no sampling), for process-parallel fits: the parent computes this once and hands the best
+mode `nt` to every chain process as `init`. Accepts the model keywords of `fit_drug` (window_days, lod, nu,
+baseline_sd, latent_w0, priors, reltol, abstol) plus `nstarts`, `maxiters`, `rng`, `logger`.
+"""
+function map_init(units, doses, pk::OneCmt, cref::Real; lod::Real = _default_lod(),
+                  priors::HierPriors = default_priors(), latent_w0::Bool = true, reltol = 1e-5, abstol = 1e-5,
+                  window_days::Real = 42, nu::Real = 5.0, baseline_sd::Real = 0.1, nstarts::Integer = 5,
+                  maxiters::Integer = 1000, rng::AbstractRNG = Random.default_rng(), logger = nothing,
+                  threaded::Bool = true, centered_lam0::Bool = true, centre_k2::Bool = true,
+                  centre_sd::Real = 0.3)
+    # The mode search always uses the fully NON-centred parameterisation: in the centred form the density is
+    # unbounded as ω -> 0 with all effects equal to μ (a spike, not a mode of any mass). The best mode is then
+    # converted: λ0 centred (if `centered_lam0`) and k2 centred for the units whose potency the data pin down
+    # (`choose_k2_centering`). Returns (nt, lps, modes, k2_centered).
+    d = prepare_data(window_units(units, window_days), doses, pk, cref; lod, solver = SolverCfg(; reltol, abstol),
+                     latent_w0, threaded, nu, baseline_sd, centered_lam0 = false)
+    model = hier_model(d, priors)
+    modes = multistart_map(model, d, priors, rng; nstarts, maxiters, logger)
+    best = argmax([m.lp for m in modes])
+    nt = modes[best].nt
+    mask = (centre_k2 && isfinite(modes[best].lp)) ? choose_k2_centering(model, nt; sd_threshold = centre_sd) :
+           falses(length(d.units))
+    msg = "  [map] k2 centred for $(count(mask)) of $(length(mask)) units (conditional sd of z_k2 < $(centre_sd))"
+    logger === nothing ? (println(msg); flush(stdout)) : logger(msg)
+    centered_lam0 && (nt = to_centered(nt))
+    nt = apply_k2_mask(nt, mask)
+    return nt, [m.lp for m in modes], modes, collect(Bool, mask)
+end
+
+"Convert a non-centred start (z_λ0) to the centred parameterisation (llam0 = μ_λ0 + ω_λ0 z_λ0)."
+function to_centered(nt::NamedTuple)
+    haskey(nt, :z_λ0) || return nt
+    rest = Base.structdiff(nt, (; z_λ0 = nothing))
+    return merge(rest, (; llam0 = nt.μ_λ0 .+ nt.ω_λ0 .* nt.z_λ0))
+end
 
 """
     fit_drug(units, doses, pk, cref; drug="drug", nchains=4, nsamples=500, nadapt=500,
@@ -499,6 +790,13 @@ thread per chain, unthreaded likelihood) when there are at least as many chains 
 "draws_per_chain", "train_models") so validation can check for leakage; the caller truncates or drops
 the training data itself.
 
+Model/fit options (phase 2b): `window_days=42` prespecified fit window (both arms truncated to day <= window before any
+split; 0 = full follow-up); `nu=5` Student-t residuals (Inf = Normal); `baseline_sd=0.1` fixed sd of the latent baselines;
+`map_starts=5`, `map_maxiters=1000` multi-start MAP (chains start with `init_jitter` around the best mode; all MAP
+log-densities stored in `diagnostics["map_lps"]`; 0 starts = data-driven jittered start); `centered_lam0=true` and
+`k2_centered` (per-unit mask, chosen from the MAP by `choose_k2_centering`) select the parameterisation of the
+random effects (they do not change the target density).
+
 `chain_only=true` returns `(chain, nothing)` right after sampling; `precomputed_chain` (e.g. the
 `chainscat` of single chains sampled in separate processes, see `chain_to_parts`) skips sampling and
 builds the `PosteriorDraws` from that chain, with `precomputed_runtime` as the wall time to record.
@@ -515,14 +813,26 @@ function fit_drug(units, doses, pk::OneCmt, cref::Real;
                   progress::Bool = false, chunksize = nothing,
                   split = "full", cutoffs = nothing, seed = nothing, log_every::Integer = 0,
                   logger = nothing, chain_only::Bool = false, precomputed_chain = nothing,
-                  precomputed_runtime = nothing)
+                  precomputed_runtime = nothing, window_days::Real = 42, nu::Real = 5.0,
+                  baseline_sd::Real = 0.1, map_starts::Integer = 5, map_maxiters::Integer = 1000,
+                  init_jitter::Real = 0.02, map_lps = nothing, worker_info = nothing,
+                  centered_lam0::Bool = true, k2_centered = nothing)
     # :auto = :units. Chains inside one process scale badly (measured: 4 concurrent tasks ran 4x slower
     # per gradient because the ODE solves allocate heavily and share one GC); use one process per chain
     # (scripts/procchains.jl, `chain_only` + `precomputed_chain`) for chain-level parallelism.
     parallel === :auto && (parallel = :units)
     parallel in (:units, :chains, :both) || throw(ArgumentError("parallel must be :auto, :units, :chains or :both"))
+    units = window_units(units, window_days)       # prespecified fit window, applied to both arms
+    threaded = parallel in (:units, :both)
+    mask = k2_centered
+    if init === nothing && map_starts > 0 && precomputed_chain === nothing
+        init, map_lps, _, mask = map_init(units, doses, pk, cref; lod, priors, latent_w0, reltol, abstol,
+                                          window_days = 0, nu, baseline_sd, nstarts = map_starts,
+                                          maxiters = map_maxiters, rng, logger, threaded, centered_lam0)
+        # chains start with small jitter around the best mode
+    end
     d = prepare_data(units, doses, pk, cref; lod, solver = SolverCfg(; reltol, abstol),
-                     latent_w0, local_grad, threaded = parallel in (:units, :both))
+                     latent_w0, local_grad, threaded, nu, baseline_sd, centered_lam0, k2_centered = mask)
     N = length(d.units)
     model = hier_model(d, priors)
     dim = 7 + 2N + (latent_w0 ? 2N : 0)
@@ -531,21 +841,33 @@ function fit_drug(units, doses, pk::OneCmt, cref::Real;
     inits = if init === nothing
         [initial_values(d, priors, rng) for _ in 1:nchains]
     elseif init isa NamedTuple
-        fill(init, nchains)
+        [jitter_init(init, rng, init_jitter) for _ in 1:nchains]
     else
         collect(init)
     end
     precomputed_chain === nothing || (nchains = size(precomputed_chain, 3))
     sampler = NUTS(nadapt, target_accept; max_depth, adtype)
     t0 = time()
+    t_last = Ref(t0)
     # optional progress log (flushed): one line every `log_every` iterations of any chain
     cb = if log_every > 0
-        count = Threads.Atomic{Int}(0)
+        ctr = Threads.Atomic{Int}(0)
         total = nchains * (nsamples + nadapt)
+        nsw = Float64[]; tdw = Float64[]; epw = Float64[]       # last `log_every` iterations (one chain per process)
         (rng_, model_, sampler_, sample_, state_, iteration; kwargs...) -> begin
-            n = Threads.atomic_add!(count, 1) + 1
+            n = Threads.atomic_add!(ctr, 1) + 1
+            st = hasproperty(sample_, :stat) ? sample_.stat : nothing
+            push!(nsw, st !== nothing && hasproperty(st, :n_steps) ? float(st.n_steps) : NaN)
+            push!(tdw, st !== nothing && hasproperty(st, :tree_depth) ? float(st.tree_depth) : NaN)
+            push!(epw, st !== nothing && hasproperty(st, :step_size) ? float(st.step_size) : NaN)
             if n % log_every == 0
-                msg = "  [fit] $(n)/$(total) iterations, $(round(time() - t0; digits = 0)) s elapsed"
+                phase = iteration <= nadapt ? "warmup" : "sampling"
+                el = round(time() - t0; digits = 0)
+                msg = "  [fit] iter $(iteration)/$(nadapt + nsamples) ($(phase)), $(n)/$(total) in total, $(el) s elapsed; " *
+                      "last $(log_every): mean n_steps $(round(mean(nsw); digits = 1)), tree depth $(round(mean(tdw); digits = 2)), " *
+                      "step size $(round(mean(epw); sigdigits = 3)), $(round((time() - t_last[]) / log_every; digits = 2)) s/iter"
+                t_last[] = time()
+                empty!(nsw); empty!(tdw); empty!(epw)
                 logger === nothing ? (println(msg); flush(stdout)) : logger(msg)
             end
             nothing
@@ -553,14 +875,20 @@ function fit_drug(units, doses, pk::OneCmt, cref::Real;
     else
         nothing
     end
-    ckw = cb === nothing ? (;) : (; callback = cb)
+    # AbstractMCMC only calls the callback for retained draws, so with progress logging the warmup is kept
+    # during sampling (discard_adapt=false) and dropped again below.
+    ckw = cb === nothing ? (;) : (; callback = cb, discard_adapt = false)
+    nsteps = cb === nothing ? nsamples : nsamples + nadapt      # with discard_adapt=false the warmup is part of N
     chain = if precomputed_chain !== nothing
         precomputed_chain
     elseif nchains == 1
-        sample(rng, model, sampler, nsamples; initial_params = inits[1], progress, ckw...)
+        sample(rng, model, sampler, nsteps; initial_params = inits[1], progress, ckw...)
     else
         alg = parallel in (:chains, :both) ? MCMCThreads() : MCMCSerial()
-        sample(rng, model, sampler, alg, nsamples, nchains; initial_params = inits, progress, ckw...)
+        sample(rng, model, sampler, alg, nsteps, nchains; initial_params = inits, progress, ckw...)
+    end
+    if cb !== nothing && precomputed_chain === nothing
+        chain = chain[(nadapt+1):end, :, :]                      # drop the warmup that was kept for the progress log
     end
     chain_only && return chain, nothing
     runtime = precomputed_runtime === nothing ? time() - t0 : float(precomputed_runtime)
@@ -568,14 +896,19 @@ function fit_drug(units, doses, pk::OneCmt, cref::Real;
         "target_accept" => target_accept, "max_depth" => max_depth, "lod" => float(lod),
         "latent_w0" => latent_w0, "parallel" => String(parallel), "local_grad" => local_grad,
         "reltol" => float(reltol), "abstol" => float(abstol), "chunksize" => cs,
-        "nthreads" => Threads.nthreads(), "n_units" => N,
+        "nthreads" => Threads.nthreads(), "n_units" => N, "nu" => float(nu), "baseline_sd" => float(baseline_sd),
+        "window_days" => float(window_days), "centered_lam0" => centered_lam0, "k2_centered_units" => count(d.k2_centered), "map_starts" => map_starts, "init_jitter" => float(init_jitter),
         "priors" => Dict(string(k) => getfield(priors, k) for k in fieldnames(HierPriors)))
     settings["seed"] = seed
+    worker_info === nothing || merge!(settings, Dict{String,Any}(string(k) => v for (k, v) in pairs(worker_info)))
     pd = posterior_draws(chain, d, string(drug), doses, pk, cref; runtime, settings, max_depth)
     # bookkeeping for the validation worker (leakage checks)
     pd.diagnostics["lod"] = float(lod)
     pd.diagnostics["nchains"] = nchains
-    pd.diagnostics["draws_per_chain"] = nsamples
+    pd.diagnostics["draws_per_chain"] = size(chain, 1)          # actual, also for precomputed chains
+    pd.diagnostics["fit_window_day"] = (window_days <= 0 || isinf(window_days)) ? 0.0 : float(window_days)
+    pd.diagnostics["nu"] = float(nu); pd.diagnostics["baseline_sd"] = float(baseline_sd)
+    pd.diagnostics["map_lps"] = map_lps === nothing ? Float64[] : collect(Float64, map_lps)
     pd.diagnostics["train_models"] = [u.model for u in d.units]
     pd.diagnostics["split"] = split isa AbstractDict ? Dict{String,Any}(string(k) => v for (k, v) in pairs(split)) :
                               Dict{String,Any}("kind" => String(split))
@@ -616,7 +949,8 @@ function chain_diagnostics(chain; max_depth::Integer = 10)
         "mean_acceptance" => :acceptance_rate in ni ? mean(chain[:acceptance_rate]) : NaN,
         "mean_tree_depth" => td === nothing ? NaN : mean(td),
         "max_tree_depth_hits" => td === nothing ? 0 : Int(sum(td .>= max_depth)),
-        "mean_step_size" => :step_size in ni ? mean(chain[:step_size]) : NaN)
+        "mean_step_size" => :step_size in ni ? mean(chain[:step_size]) : NaN,
+        "mean_n_steps" => :n_steps in ni ? mean(chain[:n_steps]) : NaN)
 end
 names_internal(chain) = Set(MCMCChains.names(chain, :internals))
 
@@ -625,18 +959,22 @@ function posterior_draws(chain, d::HierData, drug, doses, pk, cref; runtime, set
     g(s) = vec(Array(chain[s]))
     μ_λ0 = g(:μ_λ0); ω_λ0 = g(:ω_λ0); μ_k2 = g(:μ_k2); ω_k2 = g(:ω_k2)
     S = length(μ_λ0)
-    zl = hcat([g(Symbol("z_λ0[$i]")) for i in 1:N]...)
-    zk = hcat([g(Symbol("z_k2[$i]")) for i in 1:N]...)
-    λ0 = exp.(μ_λ0 .+ ω_λ0 .* zl)
-    k2 = exp.(μ_k2 .+ ω_k2 .* zk)
+    kpos = _k2_positions(d.k2_centered)
+    lk2 = hcat([d.k2_centered[i] ? g(Symbol("lk2c[$(kpos[i])]")) : μ_k2 .+ ω_k2 .* g(Symbol("z_k2[$(kpos[i])]")) for i in 1:N]...)
+    λ0 = if d.centered_lam0
+        exp.(hcat([g(Symbol("llam0[$i]")) for i in 1:N]...))
+    else
+        exp.(μ_λ0 .+ ω_λ0 .* hcat([g(Symbol("z_λ0[$i]")) for i in 1:N]...))
+    end
+    k2 = exp.(lk2)
     σ = g(:σ)
     v0c = [u.control.v0 for u in d.units]; v0t = [u.treated.v0 for u in d.units]
     # per-draw baselines: latent  w0 = v0 exp(σ_s z_s);  fixed  w0 = v0 (constant columns)
     if d.latent_w0
         zc = hcat([g(Symbol("z_w0c[$i]")) for i in 1:N]...)
         zt = hcat([g(Symbol("z_w0t[$i]")) for i in 1:N]...)
-        w0c_draws = exp.(log.(permutedims(v0c)) .+ σ .* zc)
-        w0t_draws = exp.(log.(permutedims(v0t)) .+ σ .* zt)
+        w0c_draws = exp.(log.(permutedims(v0c)) .+ d.baseline_sd .* zc)
+        w0t_draws = exp.(log.(permutedims(v0t)) .+ d.baseline_sd .* zt)
         w0c = vec(median(w0c_draws; dims = 1)); w0t = vec(median(w0t_draws; dims = 1))
     else
         w0c = v0c; w0t = v0t
@@ -647,7 +985,7 @@ function posterior_draws(chain, d::HierData, drug, doses, pk, cref; runtime, set
     diag["settings"] = settings
     return PosteriorDraws(drug, [u.model for u in d.units], collect(Dose, doses),
         fill(OneCmt(pk.CL, pk.V, pk.ka, pk.F), S), float(cref),
-        μ_λ0, ω_λ0, μ_k2, ω_k2, g(:logλ1), g(:logk1), σ, λ0, k2, w0c, w0t,
+        μ_λ0, ω_λ0, μ_k2, ω_k2, μ_λ0 .+ g(:logVtr), g(:logk1), σ, λ0, k2, w0c, w0t,
         w0c_draws, w0t_draws, diag)
 end
 
@@ -693,6 +1031,7 @@ function pointwise_loglik(pd::PosteriorDraws, units; lod = nothing, threaded = t
     set = pd.diagnostics["settings"]
     lodv = lod === nothing ? get(set, "lod", _default_lod()) : float(lod)
     cfg = SolverCfg(; reltol = get(set, "reltol", 1e-5), abstol = get(set, "abstol", 1e-5))
+    nu = float(get(set, "nu", Inf))                 # fits saved before the Student-t change used Normal residuals
     ud = _prep_units(units, lodv)
     col = Dict(m => i for (i, m) in enumerate(pd.models))
     idx = pointwise_index(ud)
@@ -711,8 +1050,8 @@ function pointwise_loglik(pd::PosteriorDraws, units; lod = nothing, threaded = t
             pwc = zeros(nc); pwt = zeros(length(u.treated.t))
             ex = pd.pk[ds] === pd.pk[1] || pd.pk[ds] == pd.pk[1] ? expo :
                  make_exposure(pd.pk[ds], pd.doses, pd.cref)
-            lc = curve_loglik(u.control, λ0, λ1, 1.0, 0.0, log(pd.w0_control_draws[ds, m]), σ, NoDrug(), lodv, cfg; pointwise = pwc)
-            lt = curve_loglik(u.treated, λ0, λ1, k1, k2, log(pd.w0_treated_draws[ds, m]), σ, ex, lodv, cfg; pointwise = pwt)
+            lc = curve_loglik(u.control, λ0, λ1, 1.0, 0.0, log(pd.w0_control_draws[ds, m]), σ, NoDrug(), lodv, cfg; pointwise = pwc, nu)
+            lt = curve_loglik(u.treated, λ0, λ1, k1, k2, log(pd.w0_treated_draws[ds, m]), σ, ex, lodv, cfg; pointwise = pwt, nu)
             if !(isfinite(lc) && isfinite(lt))
                 fill!(pwc, -Inf); fill!(pwt, -Inf)
             end
@@ -749,8 +1088,8 @@ log p(y_i | population draw s) for a NEW realisation of unit i's latent effects,
 
 Monte Carlo over M fresh standard-normal vectors (common random numbers across draws). The two
 baseline coordinates are only integrated for latent-baseline fits (`diagnostics["latent_w0"]`):
-conditional on the draw's σ and the day-0 observations the baseline posterior is
-log w0 ~ N(log v0, σ²) (flat prior on log w0), so the day-0 observation is used once. For fixed-baseline
+conditional on the day-0 observations the baseline posterior is
+log w0 ~ N(log v0, τ²) with τ = `baseline_sd` (flat prior on log w0), so the day-0 observation is used once. For fixed-baseline
 fits the baselines stay at the observed day-0 volumes. This is the whole-PDX likelihood block for
 grouped (new-PDX) PSIS-LOO. Cost: ndraw × nunit × M × 2 ODE solves. Noisy if the likelihood is
 very peaked relative to the population distribution; raise M and check the Monte Carlo error.
@@ -763,6 +1102,8 @@ function marginal_unit_loglik(pd::PosteriorDraws, units; M::Integer = 64,
     lodv = lod === nothing ? get(set, "lod", _default_lod()) : float(lod)
     cfg = SolverCfg(; reltol = get(set, "reltol", 1e-5), abstol = get(set, "abstol", 1e-5))
     latent = Bool(get(pd.diagnostics, "latent_w0", get(set, "latent_w0", false)))
+    nu = float(get(set, "nu", Inf))
+    bsd = get(set, "baseline_sd", nothing)           # legacy fits (no key): baseline sd was σ
     ud = _prep_units(units, lodv)
     dr = draws === nothing ? (1:length(pd.σ)) : draws
     S = length(dr)
@@ -775,12 +1116,13 @@ function marginal_unit_loglik(pd::PosteriorDraws, units; M::Integer = 64,
         λ1 = exp(pd.logλ1[ds]); k1 = exp(pd.logk1[ds]); σ = pd.σ[ds]
         tmp = Vector{Float64}(undef, M)
         for (i, u) in enumerate(ud)
-            hd = HierData([u], expo, lodv, cfg, latent, false, false)
+            hd = HierData([u], expo, lodv, cfg, latent, false, false; nu)
+            τ = bsd === nothing ? σ : float(bsd)
             for m in 1:M
                 λ0 = exp(pd.μ_λ0[ds] + pd.ω_λ0[ds] * ε[m, 1])
                 k2 = exp(pd.μ_k2[ds] + pd.ω_k2[ds] * ε[m, 2])
-                lwc = log(u.control.v0) + (latent ? σ * ε[m, 3] : 0.0)
-                lwt = log(u.treated.v0) + (latent ? σ * ε[m, 4] : 0.0)
+                lwc = log(u.control.v0) + (latent ? τ * ε[m, 3] : 0.0)
+                lwt = log(u.treated.v0) + (latent ? τ * ε[m, 4] : 0.0)
                 tmp[m] = unit_loglik(u, log(λ0), log(k2), log(λ1), log(k1), σ, lwc, lwt, hd)
             end
             out[s, i] = logsumexp(tmp) - log(M)
@@ -808,16 +1150,18 @@ struct SynthUnit
 end
 
 """
-    simulate_units(rng, N, doses, pk, cref; truth, w0_med=180, lod=detection_limit(), tspan=(21, 40), wmax=2000)
+    simulate_units(rng, N, doses, pk, cref; truth, w0_med=180, lod=detection_limit(), tspan=(21, 40), wmax=2000,
+                   nu=5, baseline_sd=0.1)
 
 Simulate `N` PDX units from known population parameters `truth` =
 (μ_λ0, ω_λ0, μ_k2, ω_k2, logλ1, logk1, σ). Observation times ~ twice a week to a per-unit
 horizon in [21, 40]; baseline (day-0) volume is itself a noisy observation of the true start
-volume. Curves end at the first observation above `wmax` (ethical endpoint). Observations whose true-volume + noise falls below `lod` are recorded as 0 (undetectable).
+volume. Curves end at the first observation above `wmax` (ethical endpoint). Residuals are Student-t(`nu`) scaled by σ (Inf = Normal); the day-0 observation has fixed log error sd `baseline_sd`. Observations whose true-volume + noise falls below `lod` are recorded as 0 (undetectable).
 Returns `(units, tru)` with `tru.λ0`, `tru.k2` the per-unit truths.
 """
 function simulate_units(rng::AbstractRNG, N::Integer, doses, pk, cref; truth,
-                        w0_med = 180.0, w0_sd = 0.25, lod = _default_lod(), tspan = (21.0, 40.0), wmax = 2000.0)
+                        w0_med = 180.0, w0_sd = 0.25, lod = _default_lod(), tspan = (21.0, 40.0), wmax = 2000.0,
+                        nu = 5.0, baseline_sd = 0.1)
     expo = make_exposure(pk, doses, cref)
     λ0 = exp.(truth.μ_λ0 .+ truth.ω_λ0 .* randn(rng, N))
     k2 = exp.(truth.μ_k2 .+ truth.ω_k2 .* randn(rng, N))
@@ -837,9 +1181,10 @@ function simulate_units(rng::AbstractRNG, N::Integer, doses, pk, cref; truth,
             ex = arm === :control ? NoDrug() : expo
             w, ok = simulate_tumour(θ, ex, tt; reltol = 1e-9, abstol = 1e-9)
             ok || error("synthetic simulation failed")
-            vobs = [x * exp(σ * randn(rng)) for x in w]
+            noise() = isinf(nu) ? randn(rng) : rand(rng, TDist(nu))      # Student-t(ν) scaled by σ
+            vobs = [x * exp(σ * noise()) for x in w]
             vobs = [x < lod ? 0.0 : x for x in vobs]
-            vfull = [w0 * exp(σ * randn(rng)); vobs]
+            vfull = [w0 * exp(baseline_sd * randn(rng)); vobs]
             # ethical endpoint: curve ends at the first observation above wmax
             kend = something(findfirst(>(wmax), vfull), length(vfull))
             push!(out, vfull[1:kend])
