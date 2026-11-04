@@ -1,0 +1,97 @@
+# Regimens and mouse PK priors for the PDXE drugs used in TumourPKPD.jl.
+#
+# Units: time in DAYS, dose in mg/kg, CL in L/day/kg, V in L/kg, ka in 1/day, F as a fraction.
+# Every number carries a status:
+#   verified     read from the cited source
+#   derived      arithmetic on verified numbers (shown in the comment)
+#   assumption   chosen by us; NOT a published value
+# The Gao et al. 2015 Online Methods dosing table is behind a paywall and could not be read; PDXE doses
+# are therefore "verified" only where the open Supplementary Information states them (see notes).
+
+[data]
+# Recorded volume 0 = "no measurable tumour". Treated as left-censored below this limit (assumption,
+# justification in data/README.md: 4 mm^3 = caliper volume of a 2 x 2 x 2 mm lesion, (L*W^2)/2).
+detection_limit_mm3 = 4.0
+
+# --------------------------------------------------------------------------------------------------------
+[drugs.BKM120]
+name = "BKM120"
+generic = "buparlisib"
+amt_mg_kg = 30.0
+interval_days = 1.0          # qd
+duration_days = 340.0        # doses continue through follow-up (longest treated curve: X-127/BKM120, day 334)
+route = "oral"
+dose_status = "assumption"
+dose_source = """PDXE dose NOT verified (Gao 2015 Online Methods inaccessible). 30 mg/kg po qd is the single-agent \
+efficacy dose in U87MG xenografts (Burger et al. ACS Med Chem Lett 2011;2:774, doi 10.1021/ml200156t, PMC4017971). \
+Because exposure enters the model normalised to a reference regimen, a wrong dose rescales k2 and cref but does \
+not change fitted trajectories for this regimen."""
+
+[drugs.BKM120.pk]
+status = "CL, V, F verified (mouse, IV 5 mg/kg and PO 10 mg/kg); ka, all sds assumption"
+CL = 15.84                   # 11 mL/(min kg) = 0.66 L/h/kg = 15.84 L/day/kg  (verified, Table 5)
+CL_logsd = 0.5               # assumption: one study, single strain (female CD1), one dose
+V = 1.4                      # Vss 1.4 L/kg (verified); terminal V from t1/2 1.6 h = 0.66*1.6/ln2 = 1.5 (consistent)
+V_logsd = 0.5                # assumption
+ka = 48.0                    # 2 /h (assumption; gives Tmax ~1 h, in line with the 0.5-2 h Tmax the EPAR reports for alpelisib)
+ka_logsd = 0.7               # assumption
+F = 0.80                     # text: 80%; Table 5 range 71-89% (verified)
+F_logitsd = 0.5              # assumption; logit(0.71)..logit(0.89) = 0.9..2.1 around logit(0.8)=1.39
+pk_source = "Burger MT et al., ACS Med Chem Lett 2011, 2(10):774-779, Table 5 + footnote 26 (female CD1 mice). Plasma vs blood not stated."
+
+# --------------------------------------------------------------------------------------------------------
+[drugs.BYL719]
+name = "BYL719"
+generic = "alpelisib"
+amt_mg_kg = 25.0
+interval_days = 1.0          # qd
+duration_days = 340.0
+route = "oral"
+dose_status = "assumption"
+dose_source = """PDXE dose NOT verified. 12.5, 25 and 50 mg/kg po qd are the doses used in mouse xenograft efficacy \
+studies in the EMA Piqray assessment report (EMA/CHMP/321881/2020, section 2.3.2); 25 mg/kg is the middle one. \
+Same remark as BKM120: dose only rescales exposure."""
+
+[drugs.BYL719.pk]
+status = "CL, t1/2, F verified (mouse, BLOOD); V derived; ka, all sds assumption"
+CL = 11.52                   # blood CL 0.48 L/h/kg x 24 (verified, EPAR 2.3.3). Blood, not plasma.
+CL_logsd = 0.5               # assumption
+V = 2.0                      # derived: CL*t1/2/ln2 = 0.48*2.9/0.693 = 2.0 L/kg (terminal volume). EPAR gives only a range
+                             # of 0.93-1.8 L/kg for Vss across mouse/rat/dog, so 2.0 sits slightly above the Vss bound.
+V_logsd = 0.5                # assumption
+ka = 48.0                    # 2 /h (assumption; EPAR: Tmax 0.5-2 h across species)
+ka_logsd = 0.7               # assumption
+F = 0.90                     # EPAR: bioavailability 106% in mouse, i.e. complete absorption; capped at 0.9 (assumption)
+F_logitsd = 0.7              # assumption
+pk_source = "EMA Piqray EPAR public assessment report EMA/CHMP/321881/2020, section 2.3.3 (mouse blood CL 0.48 L/h/kg, t1/2 2.9 h, F 106%)."
+
+# --------------------------------------------------------------------------------------------------------
+[drugs.binimetinib]
+name = "binimetinib"
+generic = "binimetinib (MEK162)"
+amt_mg_kg = 30.0
+interval_days = 0.5          # bid
+duration_days = 340.0
+route = "oral"
+dose_status = "verified for NSCLC, inferred for other indications"
+dose_source = """Supplementary Fig. 12 legend (Gao 2015 SI): 'Binimetinib was dosed at the MTD (30mg/kg twice daily)' \
+for the 29 NSCLC PDXs. Supplementary Fig. 13: PDAC was dosed at the CRD 3.5 mg/kg bid, which is the separate \
+treatment label 'binimetinib-3.5mpk' in the data; the combination with LFW527 used 10 mg/kg bid ('LFW527 + binimetinib'). \
+The 'binimetinib' label covers all six indications (NSCLC: 29 models, matching the n=29 MTD waterfall; PDAC: a separate \
+37-38 model CRD arm exists), so 30 mg/kg bid is inferred for all indications, not stated."""
+
+[drugs.binimetinib.pk]
+status = "CL, Vss, t1/2, F verified (nude mice, IV 1 mg/kg / PO 3-300 mg/kg); effective V derived; ka, sds assumption. ONE-COMPARTMENT IS A POOR FIT (see V note)."
+CL = 8.2368                  # 5.72 mL/(min kg) = 0.343 L/h/kg x 24 (verified)
+CL_logsd = 0.5               # assumption
+V = 2.4                      # derived effective V = CL*t1/2/ln2 = 0.3432*4.8/0.693 = 2.4 L/kg: matches the terminal half-life
+                             # (4.8 h) and AUC. The verified Vss is only 0.29 L/kg (CL/Vss gives t1/2 0.6 h), i.e. the
+                             # disposition is clearly biexponential; a TwoCmt prior is more faithful if the lead wants one.
+V_logsd = 0.7                # assumption (wider: structural mismatch)
+V_ss = 0.29                  # verified, kept for reference / TwoCmt use
+t_half_terminal_h = 4.8      # verified
+ka = 48.0                    # 2 /h (assumption)
+ka_logsd = 0.7               # assumption
+F = 0.54                     # F at 30 mg/kg in nude mice (verified; 43,47,54,42,29% at 3,10,30,100,300 mg/kg)
+F_logitsd = 0.5              # assumption
+pk_source = "EMA Mektovi EPAR EMA/CHMP/554701/2018, Table 6, study DM09-043 (athymic female nu/nu NCr mice). Plasma."
