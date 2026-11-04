@@ -1,0 +1,5 @@
+data/cache/
+fits/*.jld2
+!fits/README.md
+.DS_Store
+/Manifest.toml.bak
