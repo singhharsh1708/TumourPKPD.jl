@@ -260,8 +260,14 @@ end
     # new PDX: ω = 0 collapses to the population median; ω > 0 spreads
     pd0 = toy_pd(ω = 0.0)
     s0 = TP.simulate_regimen(pd0, pd0.doses; newpdx = true, tgrid = tg, ndraws = 5, obs_noise = false)
-    wpop, _ = simulate_tumour(Simeoni(0.15, 2.0, 0.5, 0.6, median([100.0, 150.0] .* 0 .+ [120.0, 160.0])), expo, tg)
-    @test s0[1, :] ≈ wpop rtol = 1e-10
+    # new-PDX baselines are the draw-matched baselines of randomly chosen training models (A: 120, B: 160)
+    for r in 1:5
+        w0r = s0[r, 1]
+        @test w0r in (120.0, 160.0)
+        wpop, _ = simulate_tumour(Simeoni(0.15, 2.0, 0.5, 0.6, w0r), expo, tg)
+        @test s0[r, :] ≈ wpop rtol = 1e-10
+    end
+    @test length(unique(TP.simulate_regimen(pd0, pd0.doses; newpdx = true, tgrid = tg, ndraws = 40, obs_noise = false, rng = MersenneTwister(2))[:, 1])) == 2
     pdw = toy_pd(S = 300, ω = 0.5)
     sw = TP.simulate_regimen(pdw, pdw.doses; newpdx = true, tgrid = tg, ndraws = 300, obs_noise = false, rng = MersenneTwister(1))
     @test std(log.(sw[:, end])) > 0.1
@@ -352,4 +358,185 @@ end
     else
         @info "pct_long.csv / pct_metrics.csv not found; skipping classifier cross-check"
     end
+end
+
+
+# ---------------------------------------------------------------- Phase 2: baselines, what-ifs, virtual trial
+function synth_pd(; S = 40, μk = log(0.2), ωk = 0.6, μl = log(0.15), ωl = 0.3, σ = 0.15, nm = 30, seed = 1,
+                  diag = Dict{String,Any}("settings" => Dict{String,Any}("lod" => 4.0)))
+    rng = MersenneTwister(seed)
+    doses = dosing_schedule(10.0; start = 0.0, interval = 1.0, n = 28)
+    pk = OneCmt(CL = 20.0, V = 5.0, ka = 8.0, F = 0.8)
+    cref = maximum(conc(pk, doses, 0:0.1:7))
+    w0 = 180 .* exp.(0.25 .* randn(rng, nm))
+    PD("syn", ["m$i" for i in 1:nm], doses, fill(pk, S), cref, fill(μl, S), fill(ωl, S), fill(μk, S), fill(ωk, S),
+       fill(log(8.0), S), fill(log(0.4), S), fill(σ, S), ones(S, nm), ones(S, nm), w0, w0, diag), doses
+end
+
+@testset "draw-matched baselines" begin
+    S = 20
+    base, doses = synth_pd(S = S, nm = 3)
+    wt = [100.0 + s + 1000 * j for s in 1:S, j in 1:3]          # distinct per draw and model
+    wc = wt .+ 0.5
+    pd = PD(base.drug, base.models, base.doses, base.pk, base.cref, base.μ_λ0, base.ω_λ0, base.μ_k2, base.ω_k2,
+            base.logλ1, base.logk1, base.σ, base.λ0, base.k2, vec(mean(wc; dims = 1)), vec(mean(wt; dims = 1)),
+            wc, wt, base.diagnostics)
+    tg = [0.0, 5.0, 10.0]
+    r = TP.simulate_regimen(pd, doses; model = "m2", tgrid = tg, draws = [3, 7], obs_noise = false, details = true)
+    @test r.y[:, 1] == [2103.0, 2107.0] && r.w0 == r.y[:, 1]
+    c = TP.simulate_control(pd; model = "m3", tgrid = tg, draws = [3, 7], obs_noise = false)
+    @test c[:, 1] == [3103.5, 3107.5]
+    # new PDX: baseline is the draw-matched value of some training model (all columns for that draw are candidates)
+    n = TP.simulate_regimen(pd, doses; newpdx = true, tgrid = tg, draws = repeat([3], 50), obs_noise = false, rng = MersenneTwister(1))
+    @test all(w -> w in (1103.0, 2103.0, 3103.0), n[:, 1]) && length(unique(n[:, 1])) == 3
+    # restricted pool and explicit override
+    n2 = TP.simulate_regimen(pd, doses; newpdx = true, tgrid = tg, draws = repeat([3], 20), obs_noise = false,
+                             baseline_models = ["m2"], rng = MersenneTwister(1))
+    @test all(==(2103.0), n2[:, 1])
+    n3 = TP.simulate_regimen(pd, doses; newpdx = true, tgrid = tg, draws = repeat([3], 4), obs_noise = false, w0 = [1.0, 2.0, 3.0, 4.0])
+    @test n3[:, 1] == [1.0, 2.0, 3.0, 4.0]
+    @test_throws DimensionMismatch TP.simulate_regimen(pd, doses; newpdx = true, tgrid = tg, draws = [1, 2], w0 = [1.0, 2.0, 3.0])
+    @test_throws ArgumentError TP.simulate_regimen(pd, doses; newpdx = true, tgrid = tg, ndraws = 3, baseline_models = ["zzz"])
+end
+
+@testset "what-if regimens" begin
+    doses = dosing_schedule(30.0; start = 0.0, interval = 1.0, n = 40)
+    d2 = TP.scaled_regimen(doses; multiplier = 2.0)
+    @test all(d.amt == 60.0 for d in d2) && [d.time for d in d2] == [d.time for d in doses] && doses[1].amt == 30.0
+    m = TP.make_regimen(amt_multiplier = 0.5, interval_days = 2.0, duration_days = 11.0, ref_amt = 30.0)
+    @test [d.time for d in m] == [0.0, 2.0, 4.0, 6.0, 8.0, 10.0] && all(d.amt == 15.0 for d in m) && all(d.route === :oral for d in m)
+    @test length(TP.make_regimen(interval_days = 3.0, n_doses = 4, start = 2.0, ref_amt = 10.0, route = :iv)) == 4
+    @test TP.make_regimen(interval_days = 3.0, n_doses = 4, start = 2.0, ref_amt = 10.0)[1].time == 2.0
+    @test_throws ArgumentError TP.make_regimen(interval_days = 1.0, ref_amt = 1.0)                       # neither n nor duration
+    @test_throws ArgumentError TP.make_regimen(interval_days = 1.0, n_doses = 3, duration_days = 3.0, ref_amt = 1.0)
+    # extrapolation flags
+    ex(d; kw...) = TP.is_extrapolation(doses, d; kw...)
+    @test ex(doses) == (false, String[])
+    @test ex(doses[1:28]; horizon = 28.0) == (false, String[])                      # same schedule, shorter record is fine
+    f, why = ex(d2); @test f && any(occursin("dose amount", x) for x in why) && any(occursin("one dose level", x) for x in why)
+    f, why = ex(TP.make_regimen(interval_days = 2.0, n_doses = 20, ref_amt = 30.0)); @test f && any(occursin("interval", x) for x in why)
+    f, why = ex(dosing_schedule(30.0; n = 40, interval = 1.0, route = :iv)); @test f && any(occursin("route", x) for x in why)
+    f, why = ex(dosing_schedule(30.0; n = 5, interval = 1.0); horizon = 21.0); @test f && any(occursin("stops", x) for x in why)
+    f, why = ex(doses; horizon = 60.0, observed_max_day = 45.0); @test f && any(occursin("follow-up", x) for x in why)
+    @test ex(doses; horizon = 40.0, observed_max_day = 45.0)[1] == false
+    f, why = ex(dosing_schedule(30.0; start = 3.0, n = 40, interval = 1.0)); @test f && any(occursin("first dose", x) for x in why)
+    # dose-event comparison: holidays, omissions, shifts and missed final doses must all be flagged
+    sched = dosing_schedule(30.0; n = 40, interval = 1.0)
+    exs(d) = TP.is_extrapolation(sched, d; horizon = 28.0)
+    hol = TP.make_regimen(interval_days = 1.0, days_on = 5, days_off = 2, duration_days = 28.0, ref_amt = 30.0)
+    @test [d.time for d in hol[1:8]] == [0.0, 1, 2, 3, 4, 7, 8, 9] && length(hol) == 20
+    f, why = exs(hol); @test f && any(occursin("holiday", x) && occursin("omitted", x) for x in why) && !any(occursin("interval differs", x) for x in why)
+    omit = [d for (i, d) in enumerate(sched[1:28]) if i != 11]                       # day 10 skipped
+    f, why = exs(omit); @test f && any(occursin("omitted", x) && occursin("10", x) for x in why)
+    shifted = [Dose(i == 11 ? 10.5 : d.time, d.amt, d.route) for (i, d) in enumerate(sched[1:28])]
+    f, why = exs(shifted); @test f && any(occursin("shifted", x) for x in why)
+    f, why = exs(sched[1:25]); @test f && any(occursin("stops after day 24", x) && occursin("25", x) for x in why)   # missed final doses
+    f, why = exs(vcat(sched[1:28], [Dose(3.5, 30.0, :oral)])); @test f && any(occursin("where the reference has none", x) for x in why)
+    bid = TP.make_regimen(interval_days = 0.5, amt_multiplier = 0.5, duration_days = 28.0, ref_amt = 30.0)
+    @test length(bid) == 56 && exs(bid)[1]                                           # BID at half amount per administration
+    @test exs(sched[1:28]) == (false, String[])
+    # make_regimen holiday schedules
+    @test_throws ArgumentError TP.make_regimen(interval_days = 1.0, days_off = 2.0, n_doses = 5, ref_amt = 1.0)
+    @test length(TP.make_regimen(interval_days = 1.0, days_on = 5, days_off = 2, n_doses = 12, ref_amt = 1.0)) == 12
+    @test [d.time for d in TP.make_regimen(interval_days = 1.0, days_on = 5, days_off = 2, n_doses = 7, ref_amt = 1.0)] == [0.0, 1, 2, 3, 4, 7, 8]
+    bidh = TP.make_regimen(interval_days = 0.5, days_on = 2, days_off = 1, duration_days = 6.0, ref_amt = 1.0)
+    @test [d.time for d in bidh] == [0.0, 0.5, 1.0, 1.5, 3.0, 3.5, 4.0, 4.5]
+    @test [d.time for d in TP.make_regimen(interval_days = 1.0, days_on = 3, days_off = 0, n_doses = 5, start = 2.0, ref_amt = 1.0)] == [2.0, 3, 4, 5, 6]
+    # grid
+    @test TP.pdxe_like_grid(3.5) == [0.0, 3.5]
+    @test TP.pdxe_like_grid(28.0) == [0.0, 4, 7, 10, 14, 18, 21, 24, 28]
+    for h in (3.5, 10.2, 13.9, 28.0, 41.3)
+        g = TP.pdxe_like_grid(h); @test g[1] == 0 && g[end] == h && issorted(g) && allunique(g)
+    end
+    pd, _ = synth_pd(diag = Dict{String,Any}("max_observed_day" => 50.0))
+    @test TP.is_extrapolation(pd, pd.doses; horizon = 28.0) == (false, String[])
+    @test TP.is_extrapolation(pd, pd.doses; horizon = 80.0)[1]
+    pdn, _ = synth_pd()
+    @test TP.is_extrapolation(pdn, pdn.doses; horizon = 28.0)[1]                    # unknown follow-up is flagged, conservatively
+    @test !TP.is_extrapolation(pdn, pdn.doses)[1]
+end
+
+@testset "virtual PDX trial" begin
+    pd, doses = synth_pd(S = 40, diag = Dict{String,Any}("settings" => Dict{String,Any}("lod" => 4.0), "max_observed_day" => 40.0,
+                         "median_followup_day" => 28.0))
+    # --- validation: predicted responder rate matches the generating truth (independent direct simulation)
+    hz = 28.0; tg = TP.pdxe_like_grid(hz)
+    @test tg[1] == 0.0 && tg[end] == hz && issorted(tg) && 3 < length(tg) < 15
+    rng = MersenneTwister(99)
+    N = 6000; hit = 0; cat_counts = zeros(Int, 4)
+    pk = pd.pk[1]; ex_ = PKExposure(pk, [d for d in doses if d.time <= hz], pd.cref)
+    for _ in 1:N
+        λ0 = exp(pd.μ_λ0[1] + pd.ω_λ0[1] * randn(rng)); k2 = exp(pd.μ_k2[1] + pd.ω_k2[1] * randn(rng))
+        w0 = pd.w0_treated[rand(rng, 1:length(pd.models))]
+        w, ok = simulate_tumour(Simeoni(λ0, exp(pd.logλ1[1]), exp(pd.logk1[1]), k2, w0), ex_, tg)
+        v = [t == 0 ? w0 : (x = max(w[i], 0.0) * exp(pd.σ[1] * randn(rng)); x < 4.0 ? 0.0 : x) for (i, t) in enumerate(tg)]
+        c = TP.pdxe_response_paper(tg, v).category
+        hit += TP.is_responder(c); cat_counts[findfirst(==(c), TP.RESPONSE_CATEGORIES)] += 1
+    end
+    truth = hit / N
+    @test 0.2 < truth < 0.7                                                            # an informative, intermediate rate
+    t = TP.simulate_trial(pd, doses; n_pdx = 200, ndraws = 40, rng = MersenneTwister(1))
+    se = sqrt(truth * (1 - truth) / N + truth * (1 - truth) / (200 * 40))
+    @test abs(t.summary.responder_rate.median - truth) < 4 * se + 0.01
+    @test all(abs.([t.summary.mCR.median, t.summary.mPR.median, t.summary.mSD.median, t.summary.mPD.median] .- cat_counts ./ N) .< 0.04)
+    # --- structure
+    @test length(t.responder_rate) == 40 && size(t.fractions) == (40, 4) && size(t.categories) == (200, 40) && t.n_na == 0
+    @test all(isapprox.(sum(t.fractions; dims = 2), 1.0)) && t.responder_rate ≈ t.fractions[:, 1] .+ t.fractions[:, 2]
+    @test t.summary.responder_rate.lo ≤ t.summary.responder_rate.median ≤ t.summary.responder_rate.hi
+    @test t.horizon == 28.0 && t.tgrid == tg && t.extrapolation == (false, String[])
+    # reproducible, same result for the same rng; default horizon from the fit's median follow-up
+    t2 = TP.simulate_trial(pd, doses; n_pdx = 200, ndraws = 40, rng = MersenneTwister(1))
+    @test t2.responder_rate == t.responder_rate && t2.categories == t.categories
+    # quick mode caps the work
+    tq = TP.simulate_trial(pd, doses; n_pdx = 500, ndraws = 300, quick = true, rng = MersenneTwister(1))
+    @test tq.ndraws == 40 && tq.n_pdx == 100                                           # 40 stored draws < 50 cap
+    pdb, _ = synth_pd(S = 120)
+    tq2 = TP.simulate_trial(pdb, doses; n_pdx = 500, ndraws = 300, quick = true, rng = MersenneTwister(1))
+    @test tq2.ndraws == 50 && tq2.n_pdx == 100
+    # --- dose response is monotone and flagged as extrapolation
+    rates = [TP.simulate_trial(pd, TP.scaled_regimen(doses; multiplier = m); n_pdx = 300, ndraws = 30, rng = MersenneTwister(5)).summary.responder_rate.median
+             for m in (0.25, 1.0, 4.0)]
+    @test rates[1] < rates[2] < rates[3]
+    t4 = TP.simulate_trial(pd, TP.scaled_regimen(doses; multiplier = 4.0); n_pdx = 50, ndraws = 10, rng = MersenneTwister(5))
+    @test t4.extrapolation[1] && any(occursin("dose amount", r) for r in t4.extrapolation[2])
+    # untreated-like (zero dose): essentially no responders
+    t0 = TP.simulate_trial(pd, TP.scaled_regimen(doses; multiplier = 0.0); n_pdx = 100, ndraws = 10, rng = MersenneTwister(5))
+    @test t0.summary.responder_rate.median < 0.03
+    # --- tumour_type needs fit metadata; restricts baselines
+    @test_throws ArgumentError TP.simulate_trial(pd, doses; tumour_type = "BRCA", n_pdx = 5, ndraws = 3)
+    types = vcat(fill("BRCA", 10), fill("CRC", 20))
+    pdt, _ = synth_pd(diag = Dict{String,Any}("tumour_types" => types, "settings" => Dict{String,Any}("lod" => 4.0)))
+    @test_throws ArgumentError TP.simulate_trial(pdt, doses; tumour_type = "GC", n_pdx = 5, ndraws = 3)
+    tt = TP.simulate_trial(pdt, doses; tumour_type = "BRCA", n_pdx = 20, ndraws = 5, rng = MersenneTwister(3))
+    @test tt.tumour_type == "BRCA" && size(tt.categories) == (20, 5)
+    # --- fractional horizon is kept exactly
+    th = TP.simulate_trial(pd, doses; n_pdx = 10, ndraws = 3, horizon = 3.5, rng = MersenneTwister(2))
+    @test th.horizon == 3.5 && th.tgrid == [0.0, 3.5]
+    # --- interval meaning: finite-trial predictive interval vs population credible interval
+    @test occursin("posterior predictive interval for a trial of 200 PDX", t.interval_kind) && !t.population
+    wid(x) = x.hi - x.lo
+    tr_or = TP.simulate_trial(pd, doses; n_pdx = 100, ndraws = 20, rng = MersenneTwister(7))
+    po_or = TP.simulate_trial(pd, doses; population = true, n_pdx_population = 800, ndraws = 20, rng = MersenneTwister(7))
+    @test po_or.population && po_or.n_pdx == 800 && occursin("population response probability", po_or.interval_kind)
+    @test wid(po_or.summary.responder_rate) < 0.7 * wid(tr_or.summary.responder_rate)       # oracle: only simulation error remains
+    @test abs(po_or.summary.responder_rate.median - truth) < 0.04
+    @test mean(po_or.mc_se) ≈ sqrt(truth * (1 - truth) / 800) rtol = 0.15
+    @test wid(po_or.summary.responder_rate) < 4 * 1.645 * mean(po_or.mc_se)                 # width explained by Monte Carlo SE
+    pdsp, _ = synth_pd(S = 20)
+    pdsp.μ_k2 .= range(log(0.1), log(0.4), length = 20)                                      # real posterior spread in potency
+    po_sp = TP.simulate_trial(pdsp, doses; population = true, n_pdx_population = 800, ndraws = 20, rng = MersenneTwister(7))
+    @test wid(po_sp.summary.responder_rate) > 2.5 * wid(po_or.summary.responder_rate)
+    @test TP.simulate_trial(pd, doses; population = true, quick = true, rng = MersenneTwister(1), ndraws = 5).n_pdx == 400
+    # --- compare_trials: common random numbers, paired contrasts
+    cmp = TP.compare_trials(pd, Dict("ref" => doses, "double" => TP.scaled_regimen(doses; multiplier = 2.0),
+                                     "same" => copy(doses)); n_pdx = 100, ndraws = 20, baseline = "ref")
+    @test [r.name for r in cmp.table] == ["double", "ref", "same"]
+    @test cmp.results["ref"].responder_rate == cmp.results["same"].responder_rate           # identical regimen, identical draws
+    @test cmp.contrasts["same"].median == 0.0 && cmp.contrasts["double"].median > 0
+    @test cmp.table[1].extrapolation && !cmp.table[2].extrapolation
+    @test_throws ArgumentError TP.compare_trials(pd, Dict("a" => doses); baseline = "zzz", n_pdx = 5, ndraws = 3)
+    @test occursin("posterior predictive interval", cmp.contrast_kind)
+    cmpp = TP.compare_trials(pd, Dict("ref" => doses, "double" => TP.scaled_regimen(doses; multiplier = 2.0));
+                             n_pdx_population = 300, ndraws = 6, population = true, baseline = "ref")
+    @test occursin("population response probability", cmpp.contrast_kind) && cmpp.contrasts["double"].median > 0
 end

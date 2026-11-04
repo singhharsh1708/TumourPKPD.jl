@@ -23,6 +23,8 @@ export simulate_regimen, simulate_control, predictive_bands, pdxe_response, pdxe
        RESPONSE_CATEGORIES, coverage, coverage_by_group, interval_width, interval_score, crps,
        log_predictive_density, log_predictive_density_kde, cluster_bootstrap, loo, kendall_tau_b,
        spearman, auroc, ordinal_agreement, responder_fraction, drug_ranking_agreement,
-       split_late, split_late_indices, split_models
+       split_late, split_late_indices, split_models,
+       scaled_regimen, make_regimen, is_extrapolation, simulate_trial, compare_trials, pdxe_like_grid,
+       chain_index_from_fit, detection_limit_from_fit, ensemble_failures
 
 end
