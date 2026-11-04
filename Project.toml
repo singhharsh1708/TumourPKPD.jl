@@ -26,3 +26,9 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 Turing = "fce5fe82-541a-59a6-adf8-730c64b5f9a0"
 XLSX = "fdbf4ff8-1666-58a4-91e7-1b58723a45e0"
+
+[extras]
+Test = "8dfdfd03-ebae-579b-a1cc-ee1d2e1d9d4d"
+
+[targets]
+test = ["Test"]
