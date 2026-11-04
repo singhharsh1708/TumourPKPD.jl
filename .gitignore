@@ -5,3 +5,4 @@ fits/*.jld2
 /Manifest.toml.bak
 stage/
 docs/local/
+app/screenshots/

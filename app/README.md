@@ -8,11 +8,9 @@ observed points, and a virtual PDX trial.
 Built with Bonito and WGLMakie. Everything it computes comes from `TumourPKPD`: `simulate_regimen`,
 `simulate_control`, `is_extrapolation`, `simulate_trial`, `make_regimen`.
 
-![reference regimen](screenshots/reference-regimen.png)
-![extrapolation](screenshots/extrapolation-new-pdx.png)
 
 (Static renderings of the same panels. The screenshots in this folder use **demo fits**, so every panel is
-labelled "DEMO, not fitted". `screenshots/live-browser.png` is the live app in Chrome.)
+labelled "DEMO, not fitted". Screenshots are generated locally into `screenshots/` (gitignored: views of a single PDX model overlay observed PDXE volumes, which are not redistributed).)
 
 ## Run
 
