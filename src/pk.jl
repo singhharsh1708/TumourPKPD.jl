@@ -56,45 +56,55 @@ end
 TwoCmt(CL, V1, Q, V2, ka, F) = TwoCmt(promote(CL, V1, Q, V2, ka, F)...)
 TwoCmt(; CL, V1, Q, V2, ka = 1.0, F = 1.0) = TwoCmt(CL, V1, Q, V2, ka, F)
 
+# φ(x) = (1 - exp(-x)) / x, with its x -> 0 limit. Smooth in x, so gradients
+# stay correct when two rate constants are (nearly) equal.
+@inline function phi_rel(x)
+    if abs(x) < 1e-4
+        return 1 - x / 2 + x^2 / 6 - x^3 / 24
+    end
+    return -expm1(-x) / x
+end
+
+# ∫₀^τ ka e^{-ka s} e^{-λ (τ - s)} ds = ka τ e^{-λ τ} φ((ka - λ) τ)
+@inline absorbed(ka, λ, τ) = ka * τ * exp(-λ * τ) * phi_rel((ka - λ) * τ)
+
 # Concentration at time `τ ≥ 0` after a single unit dose.
 function unit_conc(pk::OneCmt, route::Symbol, τ)
     k = pk.CL / pk.V
-    if route === :iv
-        return exp(-k * τ) / pk.V
-    end
-    ka = pk.ka
-    d = ka - k
-    if abs(d) < 1e-8 * k
-        # ka == k limit
-        return pk.F * k * τ * exp(-k * τ) / pk.V
-    end
-    return pk.F * ka / (pk.V * d) * (exp(-k * τ) - exp(-ka * τ))
+    route === :iv && return exp(-k * τ) / pk.V
+    return pk.F * absorbed(pk.ka, k, τ) / pk.V
 end
 
 function twocmt_rates(pk::TwoCmt)
     k10 = pk.CL / pk.V1
     k12 = pk.Q / pk.V1
     k21 = pk.Q / pk.V2
-    s = k10 + k12 + k21
-    r = sqrt(s^2 - 4 * k10 * k21)
-    α = (s + r) / 2
-    β = (s - r) / 2
+    # s^2 - 4 k10 k21 written as a sum of non-negative terms (no cancellation)
+    r = sqrt((k10 - k21)^2 + k12 * (k12 + 2 * (k10 + k21)))
+    α = (k10 + k12 + k21 + r) / 2
+    β = k10 * k21 / α          # avoids losing the slow rate to cancellation
     return α, β, k21
 end
 
-function unit_conc(pk::TwoCmt, route::Symbol, τ)
+# IV unit-dose disposition: (A e^{-ατ} + B e^{-βτ}) / V1. When α ≈ β the
+# system is effectively one-compartment with rate k10 (requires Q ≈ 0).
+function twocmt_coefs(pk::TwoCmt)
     α, β, k21 = twocmt_rates(pk)
+    if α - β <= 1e-12 * α
+        return one(α), zero(α), α, β
+    end
+    A = (α - k21) / (α - β)
+    B = (k21 - β) / (α - β)
+    return A, B, α, β
+end
+
+function unit_conc(pk::TwoCmt, route::Symbol, τ)
+    A, B, α, β = twocmt_coefs(pk)
     if route === :iv
-        A = (α - k21) / (α - β)
-        B = (k21 - β) / (α - β)
         return (A * exp(-α * τ) + B * exp(-β * τ)) / pk.V1
     end
-    ka = pk.ka
-    # Assumes ka distinct from α and β (true almost surely for sampled values).
-    ca = (k21 - α) / ((ka - α) * (β - α))
-    cb = (k21 - β) / ((ka - β) * (α - β))
-    ck = (k21 - ka) / ((α - ka) * (β - ka))
-    return pk.F * ka / pk.V1 * (ca * exp(-α * τ) + cb * exp(-β * τ) + ck * exp(-ka * τ))
+    # Oral = IV disposition convolved with first-order absorption, term by term.
+    return pk.F * (A * absorbed(pk.ka, α, τ) + B * absorbed(pk.ka, β, τ)) / pk.V1
 end
 
 """

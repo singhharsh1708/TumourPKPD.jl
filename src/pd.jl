@@ -78,19 +78,34 @@ solver failed, in which case `w` must not be used.
 function simulate_tumour(θ::Simeoni, exposure, tobs::AbstractVector;
                          solver = Tsit5(), reltol = 1e-6, abstol = 1e-6, maxiters = 100_000)
     T = promote_type(typeof(θ.λ0), typeof(_exposure_eltype(exposure)))
-    u0 = T[θ.w0, 0, 0, 0]
-    tend = max(float(last(tobs)), 0.0)
+    n = length(tobs)
+    n == 0 && return T[], true
+    bad = (fill(T(NaN), n), false)
+    issorted(tobs) && first(tobs) >= 0 || throw(ArgumentError("tobs must be sorted and ≥ 0"))
+    all(x -> isfinite(x) && x > 0, (θ.λ0, θ.λ1, θ.k1, θ.w0)) && isfinite(θ.k2) && θ.k2 >= 0 || return bad
+    ts = unique(float.(tobs))
+    tend = last(ts)
     if tend == 0
-        return fill(T(θ.w0), length(tobs)), true
+        return fill(T(θ.w0), n), true
     end
+    u0 = T[θ.w0, 0, 0, 0]
     stops = filter(s -> 0 < s < tend, dose_times(exposure))
     prob = ODEProblem{true}(simeoni_rhs!, u0, (0.0, tend), (θ, exposure))
-    sol = solve(prob, solver; saveat = tobs, tstops = stops, reltol, abstol, maxiters,
+    sol = solve(prob, solver; saveat = ts, tstops = stops, reltol, abstol, maxiters,
                 save_everystep = false, dense = false, verbose = false)
-    ok = SciMLBase.successful_retcode(sol)
-    ok || return fill(T(NaN), length(tobs)), false
-    w = [sum(u) for u in sol.u]
-    length(w) == length(tobs) || return fill(T(NaN), length(tobs)), false
+    SciMLBase.successful_retcode(sol) || return bad
+    length(sol.u) == length(ts) || return bad
+    wu = [sum(u) for u in sol.u]
+    all(isfinite, wu) || return bad
+    # map back onto the requested times (handles duplicates)
+    w = Vector{eltype(wu)}(undef, n)
+    k = 1
+    for (i, t) in enumerate(tobs)
+        while ts[k] != t
+            k += 1
+        end
+        w[i] = wu[k]
+    end
     return w, true
 end
 
