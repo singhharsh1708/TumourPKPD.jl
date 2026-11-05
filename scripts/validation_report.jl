@@ -1,7 +1,11 @@
 # Validation report: held-out PDX predictive checks, late-window forecast, response categories,
 # convergence tables, PSIS-LOO.
 #
-#   julia --project=TumourPKPD.jl -t 2 scripts/validation_report.jl <drug> [--marginal-loo]
+#   julia --project=TumourPKPD.jl -t 3 scripts/validation_report.jl <drug> [--marginal-loo] [--no-loo] [--ndraws=200]
+#                                      [--resp-draws=1000] [--out=DIR]
+#   julia --project=TumourPKPD.jl -t 3 scripts/validation_report.jl <drug> --fits-dir=DIR --tag=v2 [--out=DIR]
+#        model-comparison mode: verifies and scores the fits in DIR (v2) and in fits/ (v1), writes
+#        docs/validation_<drug>_<tag>.md and docs/compare_<drug>.md (v1 vs v2 key metrics)
 #   julia --project=TumourPKPD.jl -t 2 scripts/validation_report.jl --selftest
 #
 # Reads (under fits/, each a `save_fit` JLD2 holding a PosteriorDraws):
@@ -212,7 +216,7 @@ function curve_metrics(recs::Vector{CurveRecord}; level = 0.9, lod, nu, nboot = 
     cov_boot = M.cluster_bootstrap(idx -> M.coverage(y[idx], S[:, idx]; level), pdx;
                                    nboot, rng = MersenneTwister(seed))
     return (n_points = length(y), n_censored = ncens, n_curves = length(recs),
-            n_pdx = length(unique(r.model for r in recs)), level, lod, nu,
+            n_pdx = length(unique(r.model for r in recs if any(>(0), r.y))), level, lod, nu,
             coverage_pooled = cg.pooled, coverage_tumour_avg = cg.tumour_avg,
             coverage_pdx_ci = (quantile(cov_boot, 0.025), quantile(cov_boot, 0.975)),
             width_log_mean = mean_finite(wlog), n_width_nan = count(isnan, wlog),
@@ -239,17 +243,34 @@ function coverage_ragged(ys, cols; level = 0.9)
 end
 
 """
+Tail calibration: fraction of observations below the predictive `α` quantile and above the `1-α` quantile (each from
+its own finite ensemble; nominal α each; empty ensembles are skipped here and counted by the coverage). Returns
+`(below, above, n)`.
+"""
+function ragged_tails(ys, cols; α = 0.05)
+    lo = 0; hi = 0; n = 0
+    for (y, c) in zip(ys, cols)
+        isempty(c) && continue
+        n += 1
+        lo += y < quantile(c, α); hi += y > quantile(c, 1 - α)
+    end
+    return n == 0 ? (below = NaN, above = NaN, n = 0) : (below = lo / n, above = hi / n, n = n)
+end
+
+"""
 Day bins merged so that each bin aggregates at least `min_pdx` distinct PDX models for the arm (greedy from the
 left; a remainder joins the last bin). Returns the merged edges or `nothing` if even all bins together have fewer
-than `min_pdx` PDX (the arm is then suppressed).
+than `min_pdx` PDX (the arm is then suppressed). `valid(r, k)` selects which observations count as contributors
+(default all; the residual check counts only positive observations with a non-empty positive ensemble).
 """
-function merged_edges(recs::Vector{CurveRecord}, arm, edges; min_pdx)
+function merged_edges(recs::Vector{CurveRecord}, arm, edges; min_pdx, valid = (r, k) -> true)
     nb = length(edges) - 1
     sets = [Set{String}() for _ in 1:nb]
     for r in recs
         r.arm === arm || continue
-        for t in r.t
-            b = findfirst(i -> edges[i] < t <= edges[i+1], 1:nb)
+        for k in eachindex(r.t)
+            valid(r, k) || continue
+            b = findfirst(i -> edges[i] < r.t[k] <= edges[i+1], 1:nb)
             b === nothing || push!(sets[b], r.model)
         end
     end
@@ -270,7 +291,8 @@ Binned predictive check of log(V/V0) for held-out curves, per arm. Both observed
 censored at the LOD (an undetectable observation, or a simulated volume below the LOD, counts as `lod`), V0 is the
 curve's observed baseline. Per day bin: observed vs pooled predictive 5/50/95% quantiles of log(V/V0), the
 fraction below the LOD (observed vs predicted), the 90% coverage of the observed positive volumes (each from its own
-finite ensemble) and `n_pdx`, the number of distinct PDX models in the bin. With `min_pdx` the bins are merged
+finite ensemble), the tail calibration (fraction of observations below the predictive 5% / above the 95% quantile,
+nominal 5% each) and `n_pdx`, the number of distinct PDX models in the bin. With `min_pdx` the bins are merged
 until each has at least that many PDX models and arms that never reach it are suppressed (public outputs).
 """
 function binned_check(recs::Vector{CurveRecord}; lod, edges, min_pdx = nothing)
@@ -281,7 +303,7 @@ function binned_check(recs::Vector{CurveRecord}; lod, edges, min_pdx = nothing)
         for b in 1:length(ed)-1
             lo, hi = ed[b], ed[b+1]
             obs = Float64[]; obsbelow = 0; n = 0; pred = Float64[]; predbelow = 0; npred = 0
-            yc = Float64[]; cols = Vector{Vector{Float64}}(); pdx = Set{String}()
+            yc = Float64[]; cols = Vector{Vector{Float64}}(); pdx = Set{String}(); pdxcov = Set{String}()
             for r in recs
                 r.arm === arm || continue
                 for k in eachindex(r.t)
@@ -294,72 +316,207 @@ function binned_check(recs::Vector{CurveRecord}; lod, edges, min_pdx = nothing)
                     predbelow += count(<(lod), col); npred += length(col)
                     append!(pred, log.(max.(col, lod) ./ r.v0))
                     if r.y[k] > 0
-                        push!(yc, r.y[k]); push!(cols, col)
+                        push!(yc, r.y[k]); push!(cols, col); push!(pdxcov, r.model)
                     end
                 end
             end
             n == 0 && continue
             q(x) = isempty(x) ? (NaN, NaN, NaN) : (quantile(x, 0.05), quantile(x, 0.5), quantile(x, 0.95))
-            push!(out, (arm = arm, lo = lo, hi = hi, n = n, n_pdx = length(pdx), obs_q = q(obs), pred_q = q(pred),
+            # coverage and tails use the positive observations only: suppress them when fewer than min_pdx PDX contribute
+            enough = min_pdx === nothing || length(pdxcov) >= min_pdx
+            tl = enough ? ragged_tails(yc, cols) : (below = NaN, above = NaN, n = 0)
+            push!(out, (arm = arm, lo = lo, hi = hi, n = n, n_pdx = length(pdx), n_pdx_cov = length(pdxcov), obs_q = q(obs), pred_q = q(pred),
                         obs_below = obsbelow / n, pred_below = npred == 0 ? NaN : predbelow / npred,
-                        coverage90 = coverage_ragged(yc, cols; level = 0.9)))
+                        coverage90 = enough ? coverage_ragged(yc, cols; level = 0.9) : NaN, tail_below5 = tl.below, tail_above95 = tl.above))
         end
     end
     return out
+end
+
+"""
+Within-PDX residual check. For every observed positive volume the signed log residual is
+`log y - median_s log(simulated y)` (the median of its own predictive ensemble). Per arm and (merged) day bin the residuals
+are first reduced to one median per PDX, then summarised across PDX (each PDX weighted equally, so a changing set of
+PDX with follow-up cannot masquerade as a trend). `median` / `ci` (PDX bootstrap 90%) use all PDX in the bin;
+`panel_median` uses only PDX observed in every bin of that arm (a balanced panel, so any change between bins is within-PDX);
+it is `NaN` unless the panel has at least `min_pdx` PDX. Positive values mean the observed volumes are larger than predicted.
+"""
+function residual_check(recs::Vector{CurveRecord}; edges, min_pdx = nothing, nboot = 500, seed = 1)
+    out = NamedTuple[]
+    rng = MersenneTwister(seed)
+    for arm in (:treated, :control)
+        valid = (r, k) -> r.y[k] > 0 && any(x -> isfinite(x) && x > 0, @view r.sims[:, k])
+        ed = min_pdx === nothing ? edges : merged_edges(recs, arm, edges; min_pdx, valid)
+        ed === nothing && continue
+        nb = length(ed) - 1
+        per = [Dict{String,Vector{Float64}}() for _ in 1:nb]
+        for r in recs
+            r.arm === arm || continue
+            for k in eachindex(r.t)
+                r.y[k] > 0 || continue
+                b = findfirst(i -> ed[i] < r.t[k] <= ed[i+1], 1:nb)
+                b === nothing && continue
+                col = filter(x -> isfinite(x) && x > 0, @view r.sims[:, k])
+                isempty(col) && continue
+                push!(get!(per[b], r.model, Float64[]), log(r.y[k]) - median(log.(col)))
+            end
+        end
+        pm = [Dict(m => median(v) for (m, v) in per[b]) for b in 1:nb]
+        panel = isempty(pm) ? String[] : collect(intersect(Set.(keys.(pm))...))
+        for b in 1:nb
+            vals = collect(values(pm[b])); isempty(vals) && continue
+            boot = [median(rand(rng, vals, length(vals))) for _ in 1:nboot]
+            pv = [pm[b][m] for m in panel]
+            enough = length(panel) >= (min_pdx === nothing ? 1 : min_pdx)
+            push!(out, (arm = arm, lo = ed[b], hi = ed[b+1], n_pdx = length(vals), median = median(vals),
+                        ci = (quantile(boot, 0.05), quantile(boot, 0.95)),
+                        n_panel = length(panel), panel_median = enough ? median(pv) : NaN))
+        end
+    end
+    return out
+end
+
+"Pooled tail calibration over all points of the records of one arm: `(below5, above95, n)`."
+function pooled_tails(recs::Vector{CurveRecord}, arm)
+    ys = Float64[]; cols = Vector{Vector{Float64}}()
+    for r in recs
+        r.arm === arm || continue
+        for k in eachindex(r.t)
+            r.y[k] > 0 || continue
+            push!(ys, r.y[k]); push!(cols, filter(isfinite, @view r.sims[:, k]))
+        end
+    end
+    t = ragged_tails(ys, cols)
+    return (below5 = t.below, above95 = t.above, n = t.n,
+            n_pdx = length(unique(r.model for r in recs if r.arm === arm && any(>(0), r.y))))
 end
 
 "Observed curve cut to `t <= window`."
 cut_curve(c, window) = (m = c.t .<= window; (t = c.t[m], v = c.v[m]))
 
 """
-Response metrics for held-out PDX, on the curves cut to days <= `window` (the primary fit window) for both the observed
-classification and the predictions. Every model is simulated with the same `draws` (row s = one population draw across
-models) and the same detection-limit recording as the data (simulated volumes below the LOD recorded as 0). Predicted
-categories and the truth use the paper variant of the PDXE rules; the published category (`obs_cat`, model => category,
-computed by Novartis on the full follow-up) is reported separately. AUROC and its bootstrap CI use P(responder);
-Kendall τ_b uses the expected ordinal score.
+Predicted response categories of one unit's treated arm, one per draw, on the curve cut to days <= window. Same
+conventions for every mode: simulated volumes below the LOD are recorded as 0 and the day-0 volume is set to the observed
+`v0`, so the classification divides by the same quantity as the observed category. `newpdx=true`: held-out PDX, fresh
+random effects and the observed baseline with the fitted measurement error; `newpdx=false`: a training PDX with its own
+(known) random effects and stored baselines. `noise=true` is the *recorded* response (observation noise as in the data);
+`noise=false` is the *latent* response of the noise-free trajectory. Paired: both use the same random effects.
+"""
+function response_cats(pd, u, t, v0; draws, newpdx, noise, lod, seed, classifier)
+    rngs = MersenneTwister(model_seed(seed, u.model))
+    sims = if newpdx
+        w0 = M.latent_baseline(pd, v0, length(draws); rng = MersenneTwister(model_seed(seed, "$(u.model)|resp")))
+        M.simulate_regimen(pd, pd.doses; newpdx = true, tgrid = t, w0, draws, obs_noise = noise, rng = rngs)
+    else
+        M.simulate_regimen(pd, pd.doses; model = u.model, tgrid = t, draws, obs_noise = noise, rng = rngs)
+    end
+    sims[:, 2:end] .= ifelse.(sims[:, 2:end] .< lod, 0.0, sims[:, 2:end])
+    sims[:, 1] .= v0
+    return M.response_categories(t, sims; classifier)
+end
+
+"Brier score of probabilities `p` for Bool outcomes `y`."
+brier(p, y) = mean((p .- y) .^ 2)
+
+"""
+Plain-language reading of an AUROC for new-PDX response prediction. New PDX get exchangeable random effects and no
+covariates, so P(responder) differs between held-out PDX only through baseline volume, measurement schedule and Monte
+Carlo variation; a CI that includes 0.5 is reported as no demonstrated discrimination.
+"""
+function auroc_statement(auc, ci, npos, nneg)
+    (npos == 0 || nneg == 0 || isnan(auc)) &&
+        return "AUROC is undefined: the held-out set has $(npos == 0 ? "no responders" : "no non-responders")."
+    npos == 1 && return "No demonstrated responder discrimination for new PDX (exchangeable random effects, no covariates). " *
+        "Only one held-out responder: the AUROC is just the rank of that single PDX, and the cluster bootstrap conditional on one positive PDX is not informative (its interval is not evidence of discrimination)."
+    msg = if isnan(ci[1]) || ci[1] <= 0.5 <= ci[2]
+        "No demonstrated responder discrimination for new PDX (exchangeable random effects, no covariates): the AUROC interval includes 0.5."
+    elseif ci[1] > 0.5
+        "The AUROC interval excludes 0.5, but predictions are population-level (exchangeable random effects, no covariates): any discrimination comes from baseline volume and measurement schedule, not from PDX-specific biology."
+    else
+        "The AUROC interval lies below 0.5: predictions rank held-out PDX worse than chance."
+    end
+    npos < 5 && (msg *= " Only $(npos) held-out responders: the AUROC interval is wide and fragile.")
+    return msg
+end
+
+"""
+Response metrics for held-out PDX on the curves cut to days <= `window` (the primary fit window), with `ndraws` common
+posterior draws (row s = one population draw across models). The *recorded response* (noisy categories) is the main
+prediction; the *latent response* (noise-free trajectories, every draw classified) is a separately labelled sensitivity
+line. Observed and predicted categories use the paper variant of the PDXE rules. AUROC and its bootstrap CI both use
+P(responder) of the recorded response; Kendall τ_b uses the expected ordinal score; benchmarks are the constant-risk
+predictor (AUROC 0.5, Brier of the mean predicted risk) and the prevalence oracle. With `train_units` the predicted
+responder fraction of the training PDX (known random effects, in-sample) is reported next to the held-out one.
+Responder-fraction intervals are posterior predictive (they include finite-cohort variability).
 """
 function response_metrics(pd, units; draws, window = PRIMARY_WINDOW, lod, seed = 7, obs_cat = nothing,
-                          classifier = M.pdxe_response_paper)
+                          classifier = M.pdxe_response_paper, train_units = nothing)
+    t0 = time()
     names = String[]; ocat = String[]; opub = String[]; pscore = Float64[]; pres = Float64[]; modal = String[]
-    R = Vector{Vector{Union{Missing,Bool}}}()
+    pres_lat = Float64[]; pscore_lat = Float64[]
+    R = Vector{Vector{Union{Missing,Bool}}}(); Rl = Vector{Vector{Union{Missing,Bool}}}()
+    asresp(cats) = [x == "NA" ? missing : M.is_responder(x) for x in cats]
     for u in units
         c = cut_curve(u.treated, window)
         (length(c.t) >= 2 && issorted(c.t) && c.t[1] == 0) || continue
         oc = classifier(c.t, c.v).category
         oc == "NA" && continue
         v0 = baseline_volume(u.treated, median(pd.w0_treated))
-        w0 = M.latent_baseline(pd, v0, length(draws); rng = MersenneTwister(model_seed(seed, "$(u.model)|resp")))
-        sims = M.simulate_regimen(pd, pd.doses; newpdx = true, tgrid = c.t, w0, draws,
-                                  rng = MersenneTwister(model_seed(seed, u.model)))
-        sims[:, 2:end] .= ifelse.(sims[:, 2:end] .< lod, 0.0, sims[:, 2:end])
-        sims[:, 1] .= v0          # classify relative to the observed day-0 volume, like the observed category
-        cats = M.response_categories(c.t, sims; classifier)
+        cats = response_cats(pd, u, c.t, v0; draws, newpdx = true, noise = true, lod, seed, classifier)
+        latc = response_cats(pd, u, c.t, v0; draws, newpdx = true, noise = false, lod, seed, classifier)
         pr = M.category_probs(cats)
         push!(names, u.model); push!(ocat, oc)
         push!(pscore, M.expected_score(cats)); push!(pres, M.p_responder(cats))
+        push!(pscore_lat, M.expected_score(latc)); push!(pres_lat, M.p_responder(latc))
         push!(modal, M.RESPONSE_CATEGORIES[argmax([pr.mCR, pr.mPR, pr.mSD, pr.mPD])])
-        push!(R, [x == "NA" ? missing : M.is_responder(x) for x in cats])
+        push!(R, asresp(cats)); push!(Rl, asresp(latc))
         push!(opub, obs_cat === nothing ? "NA" : get(obs_cat, u.model, "NA"))
     end
     isempty(names) && return nothing
     ag = M.ordinal_agreement(pscore, ocat; responder_scores = pres)
+    ag_lat = M.ordinal_agreement(pscore_lat, ocat; responder_scores = pres_lat)
     pub = findall(!=("NA"), opub)
     ag_pub = isempty(pub) ? nothing : M.ordinal_agreement(pscore[pub], opub[pub]; responder_scores = pres[pub])
-    Rm = Matrix{Union{Missing,Bool}}(reduce(hcat, R))              # ndraw × nmodel, same draw per row
-    rf = M.responder_fraction(Rm)
-    obs_rf = mean(M.is_responder.(ocat))
+    rf = M.responder_fraction(Matrix{Union{Missing,Bool}}(reduce(hcat, R)))
+    rf_lat = M.responder_fraction(Matrix{Union{Missing,Bool}}(reduce(hcat, Rl)))
+    yresp = M.is_responder.(ocat)
+    obs_rf = mean(yresp)
     cats4 = collect(M.RESPONSE_CATEGORIES)
     conf = [count((ocat .== a) .& (modal .== b)) for a in cats4, b in cats4]      # rows observed, cols predicted modal
-    boot = M.cluster_bootstrap(names; nboot = 500, rng = MersenneTwister(seed)) do idx
+    boot = M.cluster_bootstrap(names; nboot = 1000, rng = MersenneTwister(seed)) do idx
         M.auroc(pres[idx], M.is_responder.(ocat[idx]))
     end
     bf = filter(isfinite, boot)
     auc_ci = isempty(bf) ? (NaN, NaN) : (quantile(bf, 0.025), quantile(bf, 0.975))
+    npos = count(yresp); nneg = length(yresp) - npos
+    pbar = mean(pres)
+    bench = (brier_model = brier(pres, yresp), brier_constant = brier(fill(pbar, length(pres)), yresp),
+             brier_prevalence_oracle = obs_rf * (1 - obs_rf), constant_risk = pbar, auroc_constant = 0.5)
+    # training PDX: known random effects, in-sample
+    ins = nothing
+    if train_units !== nothing
+        oy = Bool[]; Rt = Vector{Vector{Union{Missing,Bool}}}(); Rtl = Vector{Vector{Union{Missing,Bool}}}()
+        for u in train_units
+            c = cut_curve(u.treated, window)
+            (length(c.t) >= 2 && issorted(c.t) && c.t[1] == 0) || continue
+            oc = classifier(c.t, c.v).category
+            oc == "NA" && continue
+            v0 = baseline_volume(u.treated, median(pd.w0_treated))
+            push!(oy, M.is_responder(oc))
+            push!(Rt, asresp(response_cats(pd, u, c.t, v0; draws, newpdx = false, noise = true, lod, seed, classifier)))
+            push!(Rtl, asresp(response_cats(pd, u, c.t, v0; draws, newpdx = false, noise = false, lod, seed, classifier)))
+        end
+        isempty(oy) || (ins = (n_pdx = length(oy), obs_frac = mean(oy),
+                               noisy = M.responder_fraction(Matrix{Union{Missing,Bool}}(reduce(hcat, Rt))),
+                               latent = M.responder_fraction(Matrix{Union{Missing,Bool}}(reduce(hcat, Rtl)))))
+    end
     return (names = names, obs_cat = ocat, obs_published = opub, pred_modal = modal,
-            n_pdx = length(names), pred_score = pscore, p_resp = pres, agreement = ag, agreement_vs_published = ag_pub,
-            auroc_ci = auc_ci, pred_resp_frac = rf, obs_resp_frac = obs_rf, confusion = conf,
-            modal_agreement = mean(modal .== ocat), window = window,
+            n_pdx = length(names), n_draws = length(draws), runtime_s = time() - t0, n_pos = npos, n_neg = nneg,
+            pred_score = pscore, p_resp = pres, p_resp_latent = pres_lat, agreement = ag, agreement_latent = ag_lat,
+            agreement_vs_published = ag_pub, auroc_ci = auc_ci, auroc_boot_dropped = 1 - length(bf) / length(boot),
+            auroc_statement = auroc_statement(ag.auroc, auc_ci, npos, nneg), benchmark = bench,
+            pred_resp_frac = rf, pred_resp_frac_latent = rf_lat, obs_resp_frac = obs_rf, insample = ins,
+            confusion = conf, modal_agreement = mean(modal .== ocat), window = window,
             cat_counts = [count(==(c), ocat) for c in cats4])
 end
 
@@ -497,11 +654,26 @@ end
 function binned_table(io, bins)
     isempty(bins) && return println(io, "No binned check available.\n")
     println(io, "Pooled over PDX × posterior draws; both observed and simulated volumes censored at the LOD; log(V/V0) with V0 the observed baseline. ",
-            "Quantiles are 5% / 50% / 95%.\n")
-    println(io, "| arm | days | n obs | observed log(V/V0) | predicted log(V/V0) | observed < LOD | predicted < LOD | 90% coverage |\n|---|---|---|---|---|---|---|---|")
+            "Quantiles are 5% / 50% / 95%. Tail calibration: fraction of observed positive volumes below the predictive 5% quantile / above the 95% ",
+            "quantile (nominal 5% / 5%). Below the 5% quantile = tumours smaller than predicted (they shrink more or grow less than the predictive lower tail allows); excess regrowth shows in the upper tail (above the 95% quantile).\n")
+    println(io, "| arm | days | n obs (PDX) | observed log(V/V0) | predicted log(V/V0) | observed < LOD | predicted < LOD | 90% coverage | below 5% / above 95% |\n|---|---|---|---|---|---|---|---|---|")
     for b in bins
         q(t) = @sprintf("%.2f / %.2f / %.2f", t...)
-        println(io, "| $(b.arm) | $(round(Int, b.lo))–$(round(Int, b.hi)) | $(b.n) | $(q(b.obs_q)) | $(q(b.pred_q)) | $(pct(b.obs_below)) | $(pct(b.pred_below)) | $(isnan(b.coverage90) ? "n/a" : pct(b.coverage90)) |")
+        tails = isnan(b.tail_below5) ? "n/a" : "$(pct(b.tail_below5)) / $(pct(b.tail_above95))"
+        println(io, "| $(b.arm) | $(round(Int, b.lo))–$(round(Int, b.hi)) | $(b.n) ($(b.n_pdx)) | $(q(b.obs_q)) | $(q(b.pred_q)) | $(pct(b.obs_below)) | $(pct(b.pred_below)) | $(isnan(b.coverage90) ? "n/a" : pct(b.coverage90)) | $tails |")
+    end
+    println(io)
+end
+
+function residual_table(io, rows)
+    isempty(rows) && return println(io, "No residual check available.\n")
+    println(io, "Median signed log residual, `log y - median log(predictive)` per observation, reduced to one median per PDX in the bin, then the median across PDX ",
+            "(each PDX equal weight; 90% PDX-bootstrap interval). The balanced-panel column uses only PDX observed in every bin of the arm, so changes between bins ",
+            "are within-PDX rather than a changing mix of PDX. Positive = observed larger than predicted.\n")
+    println(io, "| arm | days | PDX | median residual (90% interval) | balanced panel (PDX) median residual |\n|---|---|---|---|---|")
+    for r in rows
+        pan = isnan(r.panel_median) ? "n/a" : @sprintf("%+.3f (%d)", r.panel_median, r.n_panel)
+        println(io, "| $(r.arm) | $(round(Int, r.lo))–$(round(Int, r.hi)) | $(r.n_pdx) | $(@sprintf("%+.3f (%+.3f, %+.3f)", r.median, r.ci...)) | $pan |")
     end
     println(io)
 end
@@ -544,6 +716,13 @@ function convergence_md(io, label, pd)
 end
 
 """
+Bins to hand to the public guard: all bins (their `n_pdx`) plus, for bins that show a coverage / tail value, a pseudo-bin
+carrying the number of PDX that actually contribute to those statistics (positive observations only).
+"""
+guard_bins(bins) = vcat(bins, [(arm = b.arm, lo = b.lo, hi = b.hi, n_pdx = b.n_pdx_cov) for b in bins
+                               if hasproperty(b, :n_pdx_cov) && !isnan(b.coverage90)])
+
+"""
 Writes the PUBLIC report `outdir/validation_<drug>.md` (aggregated outputs only: every bin and summary aggregates
 at least `min_pdx` PDX models, no PDX ids, no individual observations). Summaries with fewer PDX are suppressed
 and said so in the text; `assert_public_output` then refuses to write if any bin/summary under `min_pdx`, any id in
@@ -551,15 +730,21 @@ and said so in the text; `assert_public_output` then refuses to write if any bin
 """
 function write_report(drug, outdir; primary = nothing, late = nothing, rm = nothing, bins_primary = NamedTuple[],
                       bins_late = NamedTuple[], loo_c = nothing, loo_m = nothing, pd_primary = nothing, pd_late = nothing,
+                      resid_primary = NamedTuple[], resid_late = NamedTuple[], tag = "",
                       figs = String[], notes = String[], settings = "", unverified = String[],
                       ids = String[], min_pdx = M.PUBLIC_MIN_PDX)
     mkpath(outdir)
-    path = joinpath(outdir, "validation_$(drug).md")
+    name = isempty(tag) ? drug : "$(drug)_$(tag)"
+    path = joinpath(outdir, "validation_$(name).md")
     notes = copy(notes)
     sup(x, what) = (x !== nothing && x.n_pdx < min_pdx) ? (push!(notes, "$(what) suppressed: it aggregates only $(x.n_pdx) PDX models (< $(min_pdx))."); nothing) : x
     primary = sup(primary, "New-PDX summary"); late = sup(late, "Late-21 summary"); rm = sup(rm, "Response summary")
+    if rm !== nothing && rm.insample !== nothing && rm.insample.n_pdx < min_pdx
+        push!(notes, "In-sample (training PDX) response summary suppressed: it aggregates only $(rm.insample.n_pdx) PDX models (< $(min_pdx)).")
+        rm = merge(rm, (insample = nothing,))
+    end
     text = let io = IOBuffer()
-        println(io, "# Validation: $(drug)\n")
+        println(io, "# Validation: $(name)\n")
         println(io, "Generated $(Dates.format(now(), "yyyy-mm-dd HH:MM")). $(settings)\n")
         println(io, "Design: the **primary** fit (frozen stratified 80% of PDX, days ≤ $(round(Int, PRIMARY_WINDOW)) only) predicts the held-out 20% PDX; ",
                 "held-out PDX are therefore scored on days ≤ $(round(Int, PRIMARY_WINDOW)) only, and the observed response categories below are recomputed on ",
@@ -573,23 +758,36 @@ function write_report(drug, outdir; primary = nothing, late = nothing, rm = noth
         metrics_table(io, "New-PDX prediction", primary)
         println(io, "### log(V/V0) by day, with noise and censoring\n")
         binned_table(io, bins_primary)
+        isempty(resid_primary) || (println(io, "### Residuals by day, held-out PDX\n"); residual_table(io, resid_primary))
         println(io, "### Response categories on held-out PDX (PDXE rules, Gao et al. 2015)\n")
         if rm === nothing
             println(io, "Not available.\n")
         else
             println(io, "Observed and predicted categories use `pdxe_response_paper` (windows t > 10, short curves on all points) on the days ≤ $(round(Int, rm.window)) record; ",
-                    "simulated volumes below the LOD are recorded as 0 like the data. This rule reproduces the published BestAvgResponse in 98.4% of PDXE curves but its BestResponse is ",
+                    "simulated volumes below the LOD are recorded as 0 like the data and the day-0 volume is the observed one. This rule reproduces the published BestAvgResponse in 98.4% of PDXE curves but its BestResponse is ",
                     "systematically lower than the published one in ~40% of curves (published mPD scored mSD by the rule): 4-way agreement with the published labels is ~91%, ",
                     "responder vs non-responder ~99.9%.\n")
-            println(io, "Observed category counts (mCR/mPR/mSD/mPD): ", join(rm.cat_counts, "/"), " over ", length(rm.names), " held-out PDX.\n")
+            println(io, "**Recorded response** = categories of simulated noisy observations (the prediction of what would be recorded). **Latent response** = categories of the ",
+                    "noise-free trajectories, every draw classified; it is a sensitivity line that isolates the contribution of observation noise (same random effects, same LOD recording and baseline convention), ",
+                    "not a prediction of recorded categories. $(rm.n_draws) common posterior draws; response section runtime $(round(rm.runtime_s; digits = 1)) s.\n")
+            println(io, "Observed category counts (mCR/mPR/mSD/mPD): ", join(rm.cat_counts, "/"), " over ", length(rm.names), " held-out PDX ($(rm.n_pos) responder$(rm.n_pos == 1 ? "" : "s")).\n")
+            println(io, "Responder fractions (all intervals are **posterior predictive, including finite-cohort variability**, 90%):\n")
+            println(io, "| | held-out PDX (new, n=$(rm.n_pdx)) | training PDX (known random effects, in-sample$(rm.insample === nothing ? "" : ", n=$(rm.insample.n_pdx)")) |\n|---|---|---|")
+            ins = rm.insample
+            fr(x) = "$(pct(x.mean)) ($(pct(x.lo))–$(pct(x.hi)))"
+            println(io, "| observed responder fraction | $(pct(rm.obs_resp_frac)) | $(ins === nothing ? "n/a" : pct(ins.obs_frac)) |")
+            println(io, "| predicted, recorded response (noisy) | $(fr(rm.pred_resp_frac)) | $(ins === nothing ? "n/a" : fr(ins.noisy)) |")
+            println(io, "| predicted, latent response (noise-free) | $(fr(rm.pred_resp_frac_latent)) | $(ins === nothing ? "n/a" : fr(ins.latent)) |\n")
+            println(io, "$(rm.pred_resp_frac.n_missing) failed model-draws excluded (held-out, recorded).\n")
             println(io, "| metric | value |\n|---|---|")
-            println(io, "| Kendall τ_b (predicted expected ordinal score vs observed ordinal) | $(f3(rm.agreement.tau_b)) |")
-            println(io, "| AUROC responder (mCR/mPR) vs rest, ranked by predicted P(responder) | $(f3(rm.agreement.auroc)) (same score; cluster-bootstrap 95% CI $(f3(rm.auroc_ci[1]))–$(f3(rm.auroc_ci[2]))) |")
+            println(io, "| Kendall τ_b (predicted expected ordinal score vs observed ordinal) | $(f3(rm.agreement.tau_b)) (latent: $(f3(rm.agreement_latent.tau_b))) |")
+            println(io, "| AUROC responder (mCR/mPR) vs rest, ranked by predicted P(responder) | $(f3(rm.agreement.auroc)) (same score; cluster-bootstrap 95% CI $(f3(rm.auroc_ci[1]))–$(f3(rm.auroc_ci[2])); $(pct(rm.auroc_boot_dropped)) of replicates had no responder or no non-responder and were dropped; latent: $(f3(rm.agreement_latent.auroc))) |")
+            println(io, "| constant-risk benchmark | AUROC 0.5 by construction. Brier score: model $(f3(rm.benchmark.brier_model)); constant risk at the mean predicted P(responder) = $(f3(rm.benchmark.constant_risk)): $(f3(rm.benchmark.brier_constant)); prevalence-oracle reference $(f3(rm.benchmark.brier_prevalence_oracle)) |")
             println(io, "| modal predicted category = observed category | $(pct(rm.modal_agreement)) |")
             rm.agreement_vs_published === nothing || println(io,
                 "| vs the published (full follow-up) categories: τ_b / AUROC | $(f3(rm.agreement_vs_published.tau_b)) / $(f3(rm.agreement_vs_published.auroc)) (n=$(rm.agreement_vs_published.n)) |")
-            println(io, "| predicted responder fraction (common posterior draws across models) | $(pct(rm.pred_resp_frac.mean)) ($(pct(rm.pred_resp_frac.lo))–$(pct(rm.pred_resp_frac.hi))); $(rm.pred_resp_frac.n_missing) failed model-draws excluded |")
-            println(io, "| observed responder fraction | $(pct(rm.obs_resp_frac)) |\n")
+            println(io)
+            println(io, "**", rm.auroc_statement, "**\n")
             println(io, "Confusion matrix (rows observed, columns modal predicted category):\n")
             println(io, "| | ", join(M.RESPONSE_CATEGORIES, " | "), " |\n|---|---|---|---|---|")
             for (i, c) in enumerate(M.RESPONSE_CATEGORIES)
@@ -600,6 +798,7 @@ function write_report(drug, outdir; primary = nothing, late = nothing, rm = noth
         println(io, "## Forecast of days $(round(Int, LATE_WINDOW) + 1)–$(round(Int, PRIMARY_WINDOW)) from the late21 fit (known tumours)\n")
         metrics_table(io, "Late-21 forecast", late)
         isempty(bins_late) || (println(io, "### log(V/V0) by day, late-21 forecast\n"); binned_table(io, bins_late))
+        isempty(resid_late) || (println(io, "### Within-PDX residuals by day, late-21 forecast\n"); residual_table(io, resid_late))
         println(io, "## Convergence\n")
         convergence_md(io, "Primary fit", pd_primary)
         convergence_md(io, "Late-21 fit", pd_late)
@@ -623,8 +822,9 @@ function write_report(drug, outdir; primary = nothing, late = nothing, rm = noth
         String(take!(io))
     end
     summaries = [x for x in (primary, late, rm) if x !== nothing]
+    rm !== nothing && rm.insample !== nothing && push!(summaries, rm.insample)
     loo_n = [(n_pdx = l.n,) for l in (loo_c, loo_m) if l !== nothing]
-    M.assert_public_output(; bins = vcat(bins_primary, bins_late), summaries = vcat(summaries, loo_n), text, ids, figures = figs, min_pdx)
+    M.assert_public_output(; bins = vcat(guard_bins(bins_primary), guard_bins(bins_late), resid_primary, resid_late), summaries = vcat(summaries, loo_n), text, ids, figures = figs, min_pdx)
     write(path, text)
     return path
 end
@@ -640,9 +840,143 @@ primary_select(c) = (c.t .> 0) .& (c.t .<= PRIMARY_WINDOW)
 late_select(c) = (c.t .> LATE_WINDOW) .& (c.t .<= PRIMARY_WINDOW)
 const EDGES_PRIMARY = [0.0, 7, 14, 21, 28, 35, 42]
 const EDGES_LATE = [21.0, 28, 35, 42]
+const PUBMIN = M.PUBLIC_MIN_PDX
 
-function run_real(drug; ndraws = 200, seed = 1, marginal_loo = false,
-                  fitdir = joinpath(ROOT, "fits"), outdir = joinpath(ROOT, "docs"))
+"""
+Everything computed from the (already verified) fits: held-out PDX predictive check and response metrics from the
+primary fit, late21 forecast metrics, binned and residual checks (merged to >= PUBMIN PDX per bin). `counts = (primary, late, resp)`
+are the actual numbers of predictive draws (curve checks of the primary and late21 fits, response section); draw indices
+are `randperm(MersenneTwister(seed), S)[1:n]` of each fit's own `S` stored draws (`seed + 1` for the response section),
+so the plan is "same count, same seed rule" and the counts are reported.
+"""
+function evaluate_fits(units, pd_primary, pd_late, train_ids, test_ids; counts, seed = 1, obs_cat = nothing)
+    o = Dict{Symbol,Any}(:recs_new => CurveRecord[], :recs_late => CurveRecord[], :cm_new => nothing, :cm_late => nothing,
+                         :rm => nothing, :bins_new => NamedTuple[], :bins_late => NamedTuple[],
+                         :resid_new => NamedTuple[], :resid_late => NamedTuple[], :counts => counts)
+    if pd_primary !== nothing
+        test_units = [u for u in units if u.model in test_ids]
+        lod = M.detection_limit_from_fit(pd_primary); nu = M.nu_from_fit(pd_primary)
+        draws = common_draws(pd_primary, counts.primary, seed)
+        o[:recs_new] = predict_units(pd_primary, test_units; newpdx = true, select = primary_select, draws, seed)
+        o[:cm_new] = curve_metrics(o[:recs_new]; lod, nu)
+        tp = pooled_tails(o[:recs_new], :treated); cp = pooled_tails(o[:recs_new], :control)
+        o[:cm_new] = merge(o[:cm_new], (tails_treated = tp, tails_control = cp))
+        o[:bins_new] = binned_check(o[:recs_new]; lod, edges = EDGES_PRIMARY, min_pdx = PUBMIN)
+        o[:resid_new] = residual_check(o[:recs_new]; edges = EDGES_PRIMARY, min_pdx = PUBMIN)
+        rdraws = common_draws(pd_primary, counts.resp, seed + 1)
+        o[:rm] = response_metrics(pd_primary, test_units; draws = rdraws, lod, seed, obs_cat,
+                                  train_units = [u for u in units if u.model in pd_primary.models])
+    end
+    if pd_late !== nothing
+        lod = M.detection_limit_from_fit(pd_late); nu = M.nu_from_fit(pd_late)
+        draws = common_draws(pd_late, counts.late, seed)
+        o[:recs_late] = predict_units(pd_late, [u for u in units if u.model in pd_late.models]; newpdx = false,
+                                      select = late_select, draws, seed)
+        o[:cm_late] = curve_metrics(o[:recs_late]; lod, nu)
+        o[:cm_late] = merge(o[:cm_late], (tails_treated = pooled_tails(o[:recs_late], :treated), tails_control = pooled_tails(o[:recs_late], :control)))
+        o[:bins_late] = binned_check(o[:recs_late]; lod, edges = EDGES_LATE, min_pdx = PUBMIN)
+        o[:resid_late] = residual_check(o[:recs_late]; edges = EDGES_LATE, min_pdx = PUBMIN)
+    end
+    return (; (k => v for (k, v) in o)...)
+end
+
+"""
+Key metrics of an evaluation for the v1 vs v2 comparison table: `(name, value, n_pdx)` where `n_pdx` is the number of PDX
+models that actually contribute to the value (`nothing` for items not derived from PDX data). Metrics with fewer than
+PUBMIN contributing PDX are suppressed (left out).
+"""
+function key_metrics(ev, pd_primary, pd_late)
+    km = NamedTuple[]
+    add(k, v, n) = (n === nothing || n >= PUBMIN) && push!(km, (name = k, value = v, n_pdx = n))
+    cm = ev.cm_new; rm = ev.rm; cl = ev.cm_late
+    if cm !== nothing
+        add("held-out 90% coverage", cm.coverage_pooled, cm.n_pdx); add("held-out mean log predictive density", cm.lpd_mean_finite, cm.n_pdx)
+        add("held-out mean CRPS (mm³)", cm.crps_mean, cm.n_pdx)
+        add("held-out treated below-5% / above-95% tails", "$(pct(cm.tails_treated.below5)) / $(pct(cm.tails_treated.above95))", cm.tails_treated.n_pdx)
+    end
+    if rm !== nothing
+        add("observed responder fraction (held-out)", rm.obs_resp_frac, rm.n_pdx)
+        add("predicted responder fraction, recorded (held-out)", rm.pred_resp_frac.mean, rm.n_pdx)
+        add("predicted responder fraction, latent (held-out)", rm.pred_resp_frac_latent.mean, rm.n_pdx)
+        add("Kendall τ_b (held-out)", rm.agreement.tau_b, rm.n_pdx); add("AUROC (held-out)", rm.agreement.auroc, rm.n_pdx)
+        add("Brier skill vs constant risk (held-out)", 1 - rm.benchmark.brier_model / rm.benchmark.brier_constant, rm.n_pdx)
+        if rm.insample !== nothing
+            add("observed responder fraction (training)", rm.insample.obs_frac, rm.insample.n_pdx)
+            add("predicted responder fraction, recorded (training, in-sample)", rm.insample.noisy.mean, rm.insample.n_pdx)
+        end
+    end
+    if cl !== nothing
+        add("late21 90% coverage", cl.coverage_pooled, cl.n_pdx); add("late21 mean log predictive density", cl.lpd_mean_finite, cl.n_pdx)
+        add("late21 mean CRPS (mm³)", cl.crps_mean, cl.n_pdx)
+        add("late21 treated below-5% / above-95% tails", "$(pct(cl.tails_treated.below5)) / $(pct(cl.tails_treated.above95))", cl.tails_treated.n_pdx)
+        rr = [r for r in ev.resid_late if r.arm === :treated]
+        isempty(rr) || add("late21 treated median residual, last day bin", last(rr).median, last(rr).n_pdx)
+    end
+    for (lab, pd) in (("primary", pd_primary), ("late21", pd_late))
+        pd === nothing && continue
+        c = M.convergence_summary(pd)
+        c.max_rhat === nothing || add("$(lab) max R-hat", c.max_rhat, nothing)
+        c.min_ess_bulk === nothing || add("$(lab) min bulk ESS", c.min_ess_bulk, nothing)
+        c.cross_mode_rhat === nothing || add("$(lab) cross-mode R-hat", c.cross_mode_rhat, nothing)
+    end
+    ev.counts === nothing || (add("predictive draws, held-out curve check", ev.counts.primary, nothing);
+                              add("predictive draws, late21 forecast", ev.counts.late, nothing);
+                              add("predictive draws, response section", ev.counts.resp, nothing))
+    return km
+end
+
+fmtv(x) = x isa AbstractFloat ? @sprintf("%.4g", x) : string(x)
+
+"""
+`docs/compare_<drug>.md`: v1 vs v2 key metrics (public, aggregated). A metric appears only if it is present in both
+evaluations (each already suppressed below PUBMIN contributing PDX); the contributor counts of the shown metrics, and
+the bins of both evaluations (`bins1`, `bins2`), go through the public guard. `plan` documents the shared split and the
+sampling plan.
+"""
+function write_compare(drug, outdir, km1, km2; tag1, tag2, dir1, dir2, unv1, unv2, ids, plan = nothing, bins1 = NamedTuple[], bins2 = NamedTuple[])
+    d1 = Dict(m.name => m for m in km1); d2 = Dict(m.name => m for m in km2)
+    shown = [m for m in km1 if haskey(d2, m.name)]
+    io = IOBuffer()
+    println(io, "# Model comparison: $(drug), $(tag1) vs $(tag2)\n")
+    println(io, "Generated $(Dates.format(now(), "yyyy-mm-dd HH:MM")). $(tag1): `$(dir1)`; $(tag2): `$(dir2)`. Both fit sets passed the frozen-split, window, ",
+            "cutoff and held-out-leakage checks against one shared split (the script errors otherwise) and are scored by the same code. ",
+            "Aggregated metrics only: each pools at least $(PUBMIN) contributing PDX models, and metrics with fewer are left out.\n")
+    if plan !== nothing
+        println(io, "Shared split: model fraction $(plan.model_frac), seed $(plan.seed), $(plan.n_holdout) held-out PDX for this drug (identical for both fit sets; ",
+                "$(plan.declared ? "declared in all fits' metadata" : "not declared in the fits' metadata, defaults used and the held-out/training sets verified against them")). ",
+                "Sampling plan: each fit's predictive draws are `randperm(MersenneTwister(seed), S)[1:n]` over its own stored draws with the same seed rule and the same counts ",
+                "n = $(plan.counts.primary) (held-out curve check), $(plan.counts.late) (late21 forecast), $(plan.counts.resp) (response section; seed + 1); ",
+                "stored draws $(tag1): primary $(plan.S1.primary), late21 $(plan.S1.late); $(tag2): primary $(plan.S2.primary), late21 $(plan.S2.late).\n")
+    end
+    isempty(unv1) || println(io, "> $(tag1): metadata not recorded, not verified: ", join(unv1, ", "), ".")
+    isempty(unv2) || println(io, "> $(tag2): metadata not recorded, not verified: ", join(unv2, ", "), ".")
+    println(io, "\n| metric | $(tag1) | $(tag2) | $(tag2) − $(tag1) |\n|---|---|---|---|")
+    for m in shown
+        a = m.value; b = d2[m.name].value
+        delta = (a isa Real && b isa Real) ? @sprintf("%+.4g", b - a) : ""
+        println(io, "| $(m.name) | $(fmtv(a)) | $(fmtv(b)) | $delta |")
+    end
+    println(io, "\nCoverage closer to 0.90 is better; log predictive density higher is better; CRPS lower is better; tails nominal 5% / 5% ",
+            "(below the 5% quantile = smaller than predicted, above the 95% quantile = larger than predicted, i.e. excess regrowth). ",
+            "Convergence rows show whether each fit set is fit for comparison: do not interpret metric differences for a fit with R-hat > 1.01 as model differences.\n")
+    text = String(take!(io))
+    contrib = [(n_pdx = min(m.n_pdx, d2[m.name].n_pdx),) for m in shown if m.n_pdx !== nothing && d2[m.name].n_pdx !== nothing]
+    M.assert_public_output(; text, ids, summaries = contrib, bins = vcat(guard_bins(bins1), guard_bins(bins2)), figures = String[])
+    path = joinpath(outdir, "compare_$(drug).md")
+    write(path, text)
+    return path
+end
+
+"""
+`run_real(drug; fitdir, tag, ...)`: verify the fits in `fitdir` against the frozen designs and (unless `write=false`)
+write `docs/validation_<drug>[_<tag>].md` (+ figures; local figures under docs/local). `split = (model_frac, seed)` overrides
+the split declared in the fits (comparison mode passes one shared split, and every fit is verified against it); `counts =
+(primary, late, resp)` fixes the numbers of predictive draws (default: the requested counts capped at the stored draws);
+`fits = (primary, late)` passes preloaded fits. The evaluation's bins always go through the public bin guard, also with
+`write=false`. Returns the evaluation and the verification outcome. `loo=false` skips PSIS-LOO.
+"""
+function run_real(drug; ndraws = 200, nresp = 1000, seed = 1, marginal_loo = false, loo = true, write = true, tag = "",
+                  fitdir = joinpath(ROOT, "fits"), outdir = joinpath(ROOT, "docs"), split = nothing, counts = nothing, fits = nothing)
     isdefined(M, :drug_dataset) || error("data.jl (drug_dataset, load_metrics) is not included in TumourPKPD")
     units = M.drug_dataset(drug)
     drug_models = sort([u.model for u in units])
@@ -657,52 +991,96 @@ function run_real(drug; ndraws = 200, seed = 1, marginal_loo = false,
         nothing
     end
     notes = String[]; unverified = String[]
-    pd_primary = load_if(joinpath(fitdir, "$(drug)_primary.jld2"))
-    pd_late = load_if(joinpath(fitdir, "$(drug)_late21.jld2"))
-    # split settings come from the fit (frac, seed); the frozen split is recomputed and compared
+    pd_primary, pd_late = fits === nothing ? (load_if(joinpath(fitdir, "$(drug)_primary.jld2")), load_if(joinpath(fitdir, "$(drug)_late21.jld2"))) : fits
+    # split settings: the shared split if given, else the fit's declared frac/seed; the frozen split is recomputed and the
+    # fits are verified against it
     sp(pd) = pd === nothing ? nothing : meta(pd, "split")
     getsp(k, default) = (for pd in (pd_primary, pd_late); d = sp(pd); d isa AbstractDict && haskey(d, k) && return d[k]; end; default)
-    model_frac = float(getsp("model_frac", 0.2)); split_seed = Int(getsp("seed", 1))
+    model_frac = split === nothing ? float(getsp("model_frac", 0.2)) : float(split.model_frac)
+    split_seed = split === nothing ? Int(getsp("seed", 1)) : Int(split.seed)
     train_all, test_all, _ = M.frozen_pdx_split(; frac = model_frac, seed = split_seed)
     train_ids, test_ids = expected_split(drug_models; frac = model_frac, seed = split_seed, test_all)
-    recs_new = CurveRecord[]; recs_late = CurveRecord[]
-    cm_new = cm_late = rm = nothing; bins_new = NamedTuple[]; bins_late = NamedTuple[]
-    if pd_primary === nothing
-        push!(notes, "No fits/$(drug)_primary.jld2: held-out PDX prediction, response metrics and LOO skipped.")
-    else
-        append!(unverified, verify_primary_fit(pd_primary, drug, train_ids, test_ids; model_frac, seed = split_seed))
-        test_units = [u for u in units if u.model in test_ids]
-        draws = common_draws(pd_primary, ndraws, seed)
-        lod = M.detection_limit_from_fit(pd_primary); nu = M.nu_from_fit(pd_primary)
-        recs_new = predict_units(pd_primary, test_units; newpdx = true, select = primary_select, draws, seed)
-        cm_new = curve_metrics(recs_new; lod, nu)
-        bins_new = binned_check(recs_new; lod, edges = EDGES_PRIMARY, min_pdx = M.PUBLIC_MIN_PDX)
-        rm = response_metrics(pd_primary, test_units; draws, lod, seed, obs_cat)
-    end
-    if pd_late === nothing
-        push!(notes, "No fits/$(drug)_late21.jld2: late-21 forecast skipped.")
-    else
-        append!(unverified, verify_late21_fit(pd_late, drug, units, train_ids, test_ids; model_frac, seed = split_seed))
-        draws = common_draws(pd_late, ndraws, seed)
-        lod = M.detection_limit_from_fit(pd_late); nu = M.nu_from_fit(pd_late)
-        recs_late = predict_units(pd_late, [u for u in units if u.model in pd_late.models]; newpdx = false,
-                                  select = late_select, draws, seed)
-        cm_late = curve_metrics(recs_late; lod, nu)
-        bins_late = binned_check(recs_late; lod, edges = EDGES_LATE, min_pdx = M.PUBLIC_MIN_PDX)
-    end
-    # PSIS-LOO on the primary fit's training PDX, on the windowed curves the fit saw
+    pd_primary === nothing && push!(notes, "No $(fitdir)/$(drug)_primary.jld2: held-out PDX prediction, response metrics and LOO skipped.")
+    pd_primary === nothing || append!(unverified, verify_primary_fit(pd_primary, drug, train_ids, test_ids; model_frac, seed = split_seed))
+    pd_late === nothing && push!(notes, "No $(fitdir)/$(drug)_late21.jld2: late-21 forecast skipped.")
+    pd_late === nothing || append!(unverified, verify_late21_fit(pd_late, drug, units, train_ids, test_ids; model_frac, seed = split_seed))
+    Sp = pd_primary === nothing ? 0 : length(pd_primary.σ); Sl = pd_late === nothing ? 0 : length(pd_late.σ)
+    counts === nothing && (counts = (primary = min(ndraws, Sp), late = min(ndraws, Sl), resp = min(nresp, Sp)))
+    (counts.primary <= Sp && counts.resp <= Sp && counts.late <= Sl) || error("requested draw counts exceed the stored draws of $(fitdir)")
+    ev = evaluate_fits(units, pd_primary, pd_late, train_ids, test_ids; counts, seed, obs_cat)
+    # public bin guard for every evaluation (also when no report is written)
+    M.assert_public_output(; bins = vcat(guard_bins(ev.bins_new), guard_bins(ev.bins_late), ev.resid_new, ev.resid_late))
     loo_c = loo_m = nothing
-    if pd_primary !== nothing
+    if loo && pd_primary !== nothing
         ci = M.chain_index_from_fit(pd_primary)
         fit_units = M.window_units([u for u in units if u.model in pd_primary.models], PRIMARY_WINDOW)
         loo_c = M.loo(M.grouped_loglik(pd_primary, fit_units); chain_index = ci)
         marginal_loo && (loo_m = M.loo(M.marginal_unit_loglik(pd_primary, fit_units); chain_index = ci))
     end
-    figs, local_figs = make_figures(drug, outdir, recs_new, cm_new, rm, bins_new)
-    settings = "Frozen split frac $(model_frac), seed $(split_seed): $(length(test_ids)) held-out of $(length(drug_models)) paired PDX for this drug; $(ndraws) common predictive draws."
-    return write_report(drug, outdir; primary = cm_new, late = cm_late, rm, bins_primary = bins_new, bins_late,
-                        loo_c, loo_m, pd_primary, pd_late, figs, notes, settings, unverified,
-                        ids = [u.model for u in units])
+    path = nothing
+    if write
+        name = isempty(tag) ? drug : "$(drug)_$(tag)"
+        figs, local_figs = make_figures(name, outdir, ev.recs_new, ev.cm_new, ev.rm, ev.bins_new)
+        settings = "Fits: `$(fitdir)`. Frozen split frac $(model_frac), seed $(split_seed): $(length(test_ids)) held-out of $(length(drug_models)) paired PDX for this drug. Predictive draws used (of $(Sp) / $(Sl) stored in the primary / late21 fit): $(counts.primary) for the held-out curve check, $(counts.late) for the late21 forecast, $(counts.resp) for the response section."
+        path = write_report(drug, outdir; primary = ev.cm_new, late = ev.cm_late, rm = ev.rm, bins_primary = ev.bins_new, bins_late = ev.bins_late,
+                            resid_primary = ev.resid_new, resid_late = ev.resid_late, tag,
+                            loo_c, loo_m, pd_primary, pd_late, figs, notes, settings, unverified, ids = [u.model for u in units])
+    end
+    return (; ev, pd_primary, pd_late, unverified, path, ids = [u.model for u in units], n_holdout = length(test_ids),
+            model_frac, seed = split_seed, stored = (primary = Sp, late = Sl))
+end
+
+"""
+One shared split from labelled fits `[(label, pd), ...]`: every fit's declared `(model_frac, seed, holdout_models)` (when
+recorded) must be identical (error otherwise). Returns `((model_frac, seed), declared::Bool)`; without any declaration the
+defaults (0.2, 1) are used and each fit is then verified against them by `run_real`.
+"""
+function shared_split(labelled)
+    decl = Tuple[]
+    for (lab, pd) in labelled
+        pd === nothing && continue
+        sp = meta(pd, "split")
+        sp isa AbstractDict && haskey(sp, "model_frac") && haskey(sp, "seed") &&
+            push!(decl, (lab, float(sp["model_frac"]), Int(sp["seed"]), haskey(sp, "holdout_models") ? sort(String.(sp["holdout_models"])) : nothing))
+    end
+    for d in decl[2:end]
+        (d[2] == decl[1][2] && d[3] == decl[1][3]) ||
+            error("the fit sets use different splits: $(decl[1][1]) has (frac, seed) = ($(decl[1][2]), $(decl[1][3])) but $(d[1]) has ($(d[2]), $(d[3])); a comparison needs one shared split")
+        (d[4] === nothing || decl[1][4] === nothing || d[4] == decl[1][4]) ||
+            error("the fit sets declare different held-out PDX lists ($(decl[1][1]) vs $(d[1]))")
+    end
+    return isempty(decl) ? ((model_frac = 0.2, seed = 1), false) : ((model_frac = decl[1][2], seed = decl[1][3]), true)
+end
+
+"Same draw counts for both evaluations: the minimum of the requested and of every stored length (primary: curve check and response, late21)."
+function shared_counts(fits1, fits2; ndraws, nresp)
+    S(pd) = pd === nothing ? typemax(Int) : length(pd.σ)
+    return (primary = min(ndraws, S(fits1[1]), S(fits2[1])), late = min(ndraws, S(fits1[2]), S(fits2[2])),
+            resp = min(nresp, S(fits1[1]), S(fits2[1])))
+end
+
+"""
+Comparison mode. ONE shared split is established first: every fit's declared `(model_frac, seed, holdout_models)` (when
+recorded) must be identical across both fit sets (error otherwise); that split, recomputed from the frozen design, is then
+passed to both evaluations, where both fit sets are verified against it. The draw counts are the minimum of the requested
+and of every stored length, the same for both evaluations; the plan and the counts are reported in `compare_<drug>.md`.
+"""
+function run_compare(drug; tag, fitdir2, fitdir1 = joinpath(ROOT, "fits"), outdir = joinpath(ROOT, "docs"), loo = true,
+                     ndraws = 200, nresp = 1000, kwargs...)
+    fits1 = (load_if(joinpath(fitdir1, "$(drug)_primary.jld2")), load_if(joinpath(fitdir1, "$(drug)_late21.jld2")))
+    fits2 = (load_if(joinpath(fitdir2, "$(drug)_primary.jld2")), load_if(joinpath(fitdir2, "$(drug)_late21.jld2")))
+    split, declared = shared_split([("v1 primary", fits1[1]), ("v1 late21", fits1[2]), ("$(tag) primary", fits2[1]), ("$(tag) late21", fits2[2])])
+    counts = shared_counts(fits1, fits2; ndraws, nresp)
+    common = (; counts, split, outdir, ndraws, nresp, kwargs...)
+    r2 = run_real(drug; fitdir = fitdir2, tag, loo, write = true, fits = fits2, common...)
+    r1 = run_real(drug; fitdir = fitdir1, tag = "", loo = false, write = false, fits = fits1, common...)
+    km1 = key_metrics(r1.ev, r1.pd_primary, r1.pd_late); km2 = key_metrics(r2.ev, r2.pd_primary, r2.pd_late)
+    plan = (model_frac = split.model_frac, seed = split.seed, n_holdout = r2.n_holdout, declared = declared, counts,
+            S1 = r1.stored, S2 = r2.stored)
+    cp = write_compare(drug, outdir, km1, km2; tag1 = "v1", tag2 = tag, dir1 = fitdir1, dir2 = fitdir2,
+                       unv1 = r1.unverified, unv2 = r2.unverified, ids = r2.ids, plan,
+                       bins1 = vcat(r1.ev.bins_new, r1.ev.bins_late), bins2 = vcat(r2.ev.bins_new, r2.ev.bins_late))
+    return (; v2_report = r2.path, compare = cp)
 end
 
 function run_selftest(; outdir = mktempdir())
@@ -744,20 +1122,13 @@ function run_selftest(; outdir = mktempdir())
     pd_primary = mk(tr_idx, PRIMARY_WINDOW; extra = Dict("split" => split_meta, "train_models" => train_ids))
     unv = vcat(verify_primary_fit(pd_primary, drug, train_ids, test_ids; model_frac, seed),
                verify_late21_fit(pd_late, drug, units, train_ids, test_ids; model_frac, seed))
-    # known-tumour forecast of days 22-42 (training PDX, oracle per-unit parameters)
-    lod = M.detection_limit_from_fit(pd_late); nu = M.nu_from_fit(pd_late)
-    draws = common_draws(pd_late, S, seed)
+    # evaluation of both fits (same code path as the real data)
+    lod = M.detection_limit_from_fit(pd_late)
+    counts = (primary = S, late = S, resp = S)
+    ev = evaluate_fits(units, pd_primary, pd_late, train_ids, test_ids; counts, seed)
+    recs_new, recs_late, cm_new, cm_late, rm = ev.recs_new, ev.recs_late, ev.cm_new, ev.cm_late, ev.rm
+    bins_new, bins_late = ev.bins_new, ev.bins_late
     train_units = [u for u in units if u.model in train_ids]
-    recs_late = predict_units(pd_late, train_units; newpdx = false, select = late_select, draws, seed)
-    cm_late = curve_metrics(recs_late; lod, nu)
-    bins_late = binned_check(recs_late; lod, edges = EDGES_LATE, min_pdx = M.PUBLIC_MIN_PDX)
-    # held-out PDX, new-PDX prediction from the primary fit
-    tu = [u for u in units if u.model in test_ids]
-    draws = common_draws(pd_primary, S, seed)
-    recs_new = predict_units(pd_primary, tu; newpdx = true, select = primary_select, draws, seed)
-    cm_new = curve_metrics(recs_new; lod, nu)
-    bins_new = binned_check(recs_new; lod, edges = EDGES_PRIMARY, min_pdx = M.PUBLIC_MIN_PDX)
-    rm = response_metrics(pd_primary, tu; draws, lod, seed)
     # the checks must reject a leaking fit, a wrong holdout list, a wrong window, a wrong split setting and a wrong cutoff
     errs = Dict{String,Any}()
     tryerr(f) = try; f(); nothing; catch e; e; end
@@ -775,31 +1146,91 @@ function run_selftest(; outdir = mktempdir())
     errs["small bins"] = tryerr(() -> write_report("selftest_bad", mktempdir(); bins_primary = small, ids))
     errs["ids in text"] = tryerr(() -> write_report("selftest_bad", mktempdir(); notes = ["see PDX $(first(ids))"], ids))
     errs["individual figure"] = tryerr(() -> write_report("selftest_bad", mktempdir(); figs = ["docs/fig_x_bands.png"], ids))
-    pub_bins = binned_check(recs_new; lod, edges = EDGES_PRIMARY, min_pdx = M.PUBLIC_MIN_PDX)
-    @assert all(b -> b.n_pdx >= M.PUBLIC_MIN_PDX, vcat(pub_bins, bins_late)) "merged bins must aggregate >= $(M.PUBLIC_MIN_PDX) PDX"
+    @assert all(b -> b.n_pdx >= M.PUBLIC_MIN_PDX, vcat(bins_new, bins_late, ev.resid_new, ev.resid_late)) "merged bins must aggregate >= $(M.PUBLIC_MIN_PDX) PDX"
+    # new response section content
+    @assert rm.insample !== nothing && rm.insample.n_pdx >= M.PUBLIC_MIN_PDX && rm.n_draws == 200 "in-sample response / draw count"
+    @assert isfinite(rm.benchmark.brier_model) && rm.benchmark.auroc_constant == 0.5
+    @assert occursin("No demonstrated", auroc_statement(0.6, (0.4, 0.8), 3, 20)) && occursin("Only one held-out responder", auroc_statement(0.6, (0.4, 0.8), 1, 20))
+    @assert occursin("excludes 0.5", auroc_statement(0.8, (0.6, 0.9), 8, 20)) && occursin("undefined", auroc_statement(NaN, (NaN, NaN), 0, 20))
+    @assert !isempty(ev.resid_late) && all(r -> r.n_pdx >= M.PUBLIC_MIN_PDX, ev.resid_late) && all(b -> 0 <= b.tail_below5 <= 1, bins_new)
+    # compare mode: v1 vs v2 table passes the public guard and carries both columns
+    km = key_metrics(ev, pd_primary, pd_late)
+    plan = (model_frac = model_frac, seed = seed, n_holdout = length(test_ids), declared = true, counts,
+            S1 = (primary = S, late = S), S2 = (primary = S, late = S))
+    cpath = write_compare(drug, outdir, km, km; tag1 = "v1", tag2 = "v2", dir1 = "fits", dir2 = "fits_v2", unv1 = unv, unv2 = unv, ids, plan,
+                          bins1 = vcat(bins_new, bins_late), bins2 = vcat(bins_new, bins_late))
+    ctext = read(cpath, String)
+    # contributor counts: undersized metrics are suppressed by key_metrics and refused by the guard if they get through
+    small_ev = merge(ev, (cm_late = merge(ev.cm_late, (n_pdx = 3,)),))
+    km_small = key_metrics(small_ev, pd_primary, pd_late)
+    @assert !any(m -> startswith(m.name, "late21 90% coverage"), km_small) && any(m -> m.name == "held-out 90% coverage", km_small) "undersized metric must be suppressed"
+    bad_km = vcat(km, [(name = "tiny metric", value = 1.0, n_pdx = 4)])
+    errs["small metric in compare"] = tryerr(() -> write_compare(drug, mktempdir(), bad_km, bad_km; tag1 = "v1", tag2 = "v2", dir1 = "a", dir2 = "b", unv1 = String[], unv2 = String[], ids, plan))
+    bad_bins = [(arm = :treated, lo = 21.0, hi = 28.0, n_pdx = 3)]
+    errs["small bin in compare (v1 evaluation)"] = tryerr(() -> write_compare(drug, mktempdir(), km, km; tag1 = "v1", tag2 = "v2", dir1 = "a", dir2 = "b", unv1 = String[], unv2 = String[], ids, plan, bins1 = bad_bins))
+    # shared split and sampling plan
+    f1 = (pd_primary, pd_late)
+    pd_other = mk(tr_idx, PRIMARY_WINDOW; extra = Dict("split" => merge(split_meta, Dict{String,Any}("seed" => seed + 1)), "train_models" => train_ids))
+    pd_other_list = mk(tr_idx, PRIMARY_WINDOW; extra = Dict("split" => merge(split_meta, Dict{String,Any}("holdout_models" => test_ids[1:end-1])), "train_models" => train_ids))
+    @assert shared_split([("a", pd_primary), ("b", pd_late)]) == ((model_frac = model_frac, seed = seed), true)
+    errs["different split seed"] = tryerr(() -> shared_split([("v1", pd_primary), ("v2", pd_other)]))
+    errs["different holdout list"] = tryerr(() -> shared_split([("v1", pd_primary), ("v2", pd_other_list)]))
+    small_pd = mk(tr_idx, PRIMARY_WINDOW; extra = Dict("split" => split_meta))
+    cut = M.PosteriorDraws(small_pd.drug, small_pd.models, small_pd.doses, small_pd.pk[1:120], small_pd.cref, small_pd.μ_λ0[1:120], small_pd.ω_λ0[1:120],
+                           small_pd.μ_k2[1:120], small_pd.ω_k2[1:120], small_pd.logλ1[1:120], small_pd.logk1[1:120], small_pd.σ[1:120],
+                           small_pd.λ0[1:120, :], small_pd.k2[1:120, :], small_pd.w0_control, small_pd.w0_treated,
+                           small_pd.w0_control_draws[1:120, :], small_pd.w0_treated_draws[1:120, :], small_pd.diagnostics)
+    @assert shared_counts((pd_primary, pd_late), (cut, pd_late); ndraws = 150, nresp = 1000) == (primary = 120, late = 150, resp = 120) "draw counts must be the minimum over both fit sets"
+    @assert occursin("| v1 | v2 |", ctext) && occursin("held-out 90% coverage", ctext) && !any(id -> occursin(id, ctext), ids)
     @assert all(e -> e isa ErrorException, values(errs)) "verification failed to reject: $(join([k for (k, e) in errs if !(e isa ErrorException)], ", "))"
     # PSIS-LOO on the training PDX, conditional (windowed curves)
     fit_units = M.window_units(train_units, PRIMARY_WINDOW)
     loo_c = M.loo(M.grouped_loglik(pd_primary, fit_units); chain_index = M.chain_index_from_fit(pd_primary))
     figs, local_figs = make_figures("selftest", outdir, recs_new, cm_new, rm, bins_new)
     p = write_report("selftest", outdir; primary = cm_new, late = cm_late, rm, bins_primary = bins_new, bins_late,
+                     resid_primary = ev.resid_new, resid_late = ev.resid_late,
                      loo_c, pd_primary, pd_late, figs, unverified = unv, ids,
                      notes = ["SELFTEST with an oracle posterior (true parameters, Student-t noise); pipeline check only."])
     println("selftest report: ", p)
     println("late21 forecast coverage (nominal 0.9): ", f3(cm_late.coverage_pooled), "  PDX-avg ", f3(cm_late.coverage_tumour_avg),
             "   held-out new-PDX coverage: ", f3(cm_new.coverage_pooled))
-    println("new-PDX response: tau_b=", f3(rm.agreement.tau_b), " AUROC=", f3(rm.agreement.auroc), " modal agreement=", f3(rm.modal_agreement), " n=", rm.agreement.n)
+    println("new-PDX response: tau_b=", f3(rm.agreement.tau_b), " AUROC=", f3(rm.agreement.auroc), " modal agreement=", f3(rm.modal_agreement), " n=", rm.agreement.n,
+            "; responder fraction obs ", pct(rm.obs_resp_frac), " pred recorded ", pct(rm.pred_resp_frac.mean), " latent ", pct(rm.pred_resp_frac_latent.mean),
+            "; in-sample obs ", pct(rm.insample.obs_frac), " pred ", pct(rm.insample.noisy.mean), " latent ", pct(rm.insample.latent.mean))
+    println("treated tails (below 5% / above 95%): new-PDX ", pct(cm_new.tails_treated.below5), " / ", pct(cm_new.tails_treated.above95),
+            "; late21 ", pct(cm_late.tails_treated.below5), " / ", pct(cm_late.tails_treated.above95), "; response runtime ", round(rm.runtime_s; digits = 1), " s")
     println("verification rejected: ", join(["$k ($(first(e.msg, 36)))" for (k, e) in errs], " | "))
     println("public figures: ", join(basename.(figs), ", "), "  local: ", join(basename.(local_figs), ", "))
-    return (; cm_late, cm_new, rm, path = p)
+    return (; cm_late, cm_new, rm, path = p, compare = cpath)
+end
+
+
+function parse_args(args)
+    pos = [a for a in args if !startswith(a, "--")]
+    kw = Dict{String,String}()
+    for a in args
+        startswith(a, "--") && occursin("=", a) && (kv = split(a[3:end], "="; limit = 2); kw[kv[1]] = kv[2])
+    end
+    return pos, kw
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
     ensure_loaded()
     args = ARGS
+    pos, kw = parse_args(args)
     if "--selftest" in args || isempty(args)
         run_selftest(outdir = get(ENV, "VALIDATE_SELFTEST_DIR", mktempdir()))
     else
-        run_real(args[1]; marginal_loo = "--marginal-loo" in args)
+        common = (; ndraws = parse(Int, get(kw, "ndraws", "200")), nresp = parse(Int, get(kw, "resp-draws", "1000")),
+                  marginal_loo = "--marginal-loo" in args, loo = !("--no-loo" in args),
+                  outdir = abspath(get(kw, "out", joinpath(ROOT, "docs"))))
+        if haskey(kw, "fits-dir")
+            tag = get(kw, "tag", "v2")
+            r = run_compare(pos[1]; tag, fitdir2 = abspath(kw["fits-dir"]), common...)
+            println("report: ", r.v2_report, "\ncomparison: ", r.compare)
+        else
+            r = run_real(pos[1]; tag = get(kw, "tag", ""), common...)
+            println("report: ", r.path)
+        end
     end
 end

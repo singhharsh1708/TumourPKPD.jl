@@ -8,6 +8,17 @@ function _draw_indices(rng, nall::Int, n::Int)
     return sort!(randperm(rng, nall)[1:n])
 end
 
+# Per-row PDX parameters (λ0, k2, λ1) of stored draw `i`: a known model `j` uses its own stored λ0/k2 and the draw's
+# pooled λ1; a new PDX draws fresh effects (independent log-normal λ0, k2 from `z1`, `z2`) with the draw's pooled λ1.
+# This is the single place to change when the fits gain correlated (log λ0, log k2) effects or a per-PDX transition
+# volume (then use the bivariate draw and λ1 = λ0·Vtr_i).
+@inline function _row_params(pd, i, j, newpdx::Bool, z1, z2)
+    if newpdx
+        return (exp(pd.μ_λ0[i] + pd.ω_λ0[i] * z1), exp(pd.μ_k2[i] + pd.ω_k2[i] * z2), exp(pd.logλ1[i]))
+    end
+    return (pd.λ0[i, j], pd.k2[i, j], exp(pd.logλ1[i]))
+end
+
 # Core: returns (y, idx, σ, λ0, k2) for the selected draws. `mkexpo(i)` builds the
 # exposure object for stored draw `i`.
 function _simulate(pd, mkexpo, w0, w0mat::Matrix{Float64}, tgrid, ndraws, model, newpdx, obs_noise,
@@ -62,21 +73,15 @@ function _simulate(pd, mkexpo, w0, w0mat::Matrix{Float64}, tgrid, ndraws, model,
 
     λ0 = Vector{Float64}(undef, n)
     k2 = Vector{Float64}(undef, n)
+    λ1 = Vector{Float64}(undef, n)
     for r in 1:n
-        i = idx[r]
-        if newpdx
-            λ0[r] = exp(pd.μ_λ0[i] + pd.ω_λ0[i] * zλ[r])
-            k2[r] = exp(pd.μ_k2[i] + pd.ω_k2[i] * zk[r])
-        else
-            λ0[r] = pd.λ0[i, j]
-            k2[r] = pd.k2[i, j]
-        end
+        λ0[r], k2[r], λ1[r] = _row_params(pd, idx[r], j, newpdx, newpdx ? zλ[r] : 0.0, newpdx ? zk[r] : 0.0)
     end
 
     y = Matrix{Float64}(undef, n, nt)
     Threads.@threads for r in 1:n
         i = idx[r]
-        θ = Simeoni(λ0[r], exp(pd.logλ1[i]), exp(pd.logk1[i]), k2[r], w0s[r])
+        θ = Simeoni(λ0[r], λ1[r], exp(pd.logk1[i]), k2[r], w0s[r])
         w, ok = simulate_tumour(θ, mkexpo(i), tg; reltol = rtol, abstol = atol)
         if ok
             if obs_noise
