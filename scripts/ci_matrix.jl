@@ -1,10 +1,11 @@
 # Build the job matrices for .github/workflows/fits.yml from the workflow inputs.
 #
 #   julia scripts/ci_matrix.jl [--drugs=a,b] [--designs=primary,late21] [--nchains=4] [--nadapt=500]
-#                              [--parts=2] [--draws=250] [--seglen=250] [--burnin=25] [--units=N]
+#                              [--parts=2] [--draws=250] [--seglen=125] [--burnin=25] [--units=N]
+#                              [--model=v1|v2] [--waning=false|true]
 #
 # Inputs come from the command line, else from the environment (IN_DRUGS, IN_DESIGNS, IN_NCHAINS,
-# IN_NADAPT, IN_PARTS, IN_DRAWS, IN_SEGLEN, IN_BURNIN, IN_UNITS), else from the defaults below. Standard library only, so it runs
+# IN_NADAPT, IN_PARTS, IN_DRAWS, IN_SEGLEN, IN_BURNIN, IN_UNITS, IN_MODEL, IN_WANING), else from the defaults below. Standard library only, so it runs
 # without instantiating the project. With $GITHUB_OUTPUT set it appends the outputs there; without it
 # (local dry run) it prints them. Invalid input is an error: the values end up in artifact names, paths and
 # shell commands, so drug names are restricted to [A-Za-z0-9._-] and checked against data/regimens.toml.
@@ -16,8 +17,10 @@ using TOML
 const ROOT = normpath(joinpath(@__DIR__, ".."))
 const DESIGNS = ["primary", "late21"]
 const MAX_MATRIX = 256        # GitHub limit on jobs per matrix
+const MAX_SEGMENTS = 4       # warmup, warmup2, warmup3, warmup4 jobs in fits.yml
 const DEFAULTS = Dict("drugs" => "binimetinib,BKM120,BYL719", "designs" => "primary,late21", "nchains" => "4",
-    "nadapt" => "500", "parts" => "2", "draws" => "250", "seglen" => "250", "burnin" => "25", "units" => "")
+    "nadapt" => "500", "parts" => "2", "draws" => "250", "seglen" => "125", "burnin" => "25", "units" => "",
+    "model" => "v1", "waning" => "false")
 
 function parse_args(args)
     kv = Dict{String,String}()
@@ -75,12 +78,20 @@ function build(kv)
     parts = intopt(setting(kv, "parts"), "parts"; lo = 1, hi = 32)
     nadapt = intopt(setting(kv, "nadapt"), "nadapt"; lo = 1, hi = 100_000)
     draws = intopt(setting(kv, "draws"), "draws_per_part"; lo = 1, hi = 100_000)
-    # seglen > 0 splits warmup into two jobs per chain (segments of seglen iterations); only two segments are supported.
-    # seglen >= nadapt needs one segment only, so it is the same as a single warmup job.
+    # seglen > 0 splits warmup into nseg = ceil(nadapt / seglen) chained jobs per chain (segments of seglen iterations);
+    # at most MAX_SEGMENTS (warmup, warmup2, warmup3, warmup4 in fits.yml). seglen >= nadapt is one segment, i.e. a single job.
     seglen = intopt(setting(kv, "seglen"), "seglen"; lo = 0, hi = 100_000)
-    seglen > 0 && nadapt > 2 * seglen && error("nadapt ($nadapt) must be <= 2 * seglen ($(2 * seglen)): only two warmup segments are supported")
-    segmented = seglen > 0 && seglen < nadapt
+    seglen > 0 && nadapt > MAX_SEGMENTS * seglen &&
+        error("nadapt ($nadapt) must be <= $MAX_SEGMENTS * seglen ($(MAX_SEGMENTS * seglen)): at most $MAX_SEGMENTS warmup segments are supported")
+    nseg = seglen > 0 ? cld(nadapt, seglen) : 1
+    segmented = nseg > 1
     burnin = intopt(setting(kv, "burnin"), "burnin"; lo = 0, hi = 100_000)
+    model = setting(kv, "model")
+    model in ("v1", "v2") || error("model must be v1 or v2, got $(repr(model))")
+    wn = setting(kv, "waning")
+    wn in ("true", "false") || error("waning must be true or false, got $(repr(wn))")
+    waning = wn == "true"
+    suffix = (model == "v2" ? "_v2" : "") * (waning ? "_waning" : "")      # appended to fits/<drug>_<design> by fit_stage merge
     us = setting(kv, "units")
     units = isempty(us) ? 0 : intopt(us, "units"; lo = 1, hi = 100_000)
 
@@ -91,7 +102,7 @@ function build(kv)
     for (name, m) in (("init", init), ("warmup", warmup), ("sample", sample))
         length(m) <= MAX_MATRIX || error("$name matrix has $(length(m)) jobs, limit is $MAX_MATRIX")
     end
-    (; drugs, designs, nchains, parts, nadapt, draws, seglen, segmented, burnin, units, init, warmup, sample, merge = init)
+    (; drugs, designs, nchains, parts, nadapt, draws, seglen, nseg, segmented, burnin, units, model, waning, suffix, init, warmup, sample, merge = init)
 end
 
 # Compact JSON for the flat NamedTuple rows used above (strings and integers only).
@@ -114,8 +125,12 @@ function outputs(b)
         "draws" => string(b.draws),
         "seglen" => string(b.seglen),
         "segmented" => string(b.segmented),
+        "nseg" => string(b.nseg),
         "burnin" => string(b.burnin),
         "units" => b.units == 0 ? "" : string(b.units),
+        "model" => b.model,
+        "waning" => string(b.waning),
+        "suffix" => b.suffix,
     ]
 end
 
@@ -136,7 +151,7 @@ function main(args)
     println(stderr, "ci_matrix: ", length(b.init), " init/merge, ", length(b.warmup), " warmup, ",
         length(b.sample), " sample jobs (drugs=", join(b.drugs, ","), " designs=", join(b.designs, ","),
         " chains=", b.nchains, " parts=", b.parts,
-        " warmup=", b.segmented ? "2 segments of $(b.seglen)" : "1 job", ")")
+        " warmup=", b.segmented ? "$(b.nseg) segments of $(b.seglen)" : "1 job", ")")
 end
 
 abspath(PROGRAM_FILE) == (@__FILE__) && main(ARGS)

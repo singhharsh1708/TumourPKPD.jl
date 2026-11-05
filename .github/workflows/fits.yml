@@ -39,14 +39,20 @@ on:
         description: Draws per part, so draws per chain = parts x draws_per_part
         default: '250'
       seglen:
-        description: Warmup segment length in iterations (0 = one warmup job; otherwise two jobs per chain, needs nadapt <= 2 x seglen)
-        default: '250'
+        description: Warmup segment length in iterations (0 = one warmup job; otherwise ceil(nadapt / seglen) chained jobs per chain, at most 4, so nadapt <= 4 x seglen)
+        default: '125'
       burnin:
         description: Discarded iterations at the start of each sampling part (no adaptation)
         default: '25'
       units:
         description: Optional, subsample to N PDX units per drug (smoke tests only; leave empty for real fits)
         default: ''
+      model:
+        description: Model version, v1 (independent effects, pooled transition volume) or v2 (correlated log lambda0/log k2, per-PDX transition volume); v2 fits are saved as <drug>_<design>_v2
+        default: v1
+      waning:
+        description: Pooled waning efficacy k2 exp(-rho t), true or false (sensitivity fit; saved with a _waning suffix)
+        default: 'false'
 
 # One run at a time per ref and drug/design selection. A second identical dispatch waits (it replaces any older
 # waiting one) instead of running in parallel; a running fit is never cancelled.
@@ -79,8 +85,12 @@ jobs:
       draws: ${{ steps.matrix.outputs.draws }}
       seglen: ${{ steps.matrix.outputs.seglen }}
       segmented: ${{ steps.matrix.outputs.segmented }}
+      nseg: ${{ steps.matrix.outputs.nseg }}
       burnin: ${{ steps.matrix.outputs.burnin }}
       units: ${{ steps.matrix.outputs.units }}
+      model: ${{ steps.matrix.outputs.model }}
+      waning: ${{ steps.matrix.outputs.waning }}
+      suffix: ${{ steps.matrix.outputs.suffix }}
       depot_key: ${{ steps.keys.outputs.depot }}
     steps:
       - name: Require STAGE_KEY
@@ -111,6 +121,8 @@ jobs:
           IN_SEGLEN: ${{ inputs.seglen }}
           IN_BURNIN: ${{ inputs.burnin }}
           IN_UNITS: ${{ inputs.units }}
+          IN_MODEL: ${{ inputs.model }}
+          IN_WANING: ${{ inputs.waning }}
         run: julia scripts/ci_matrix.jl
 
       - name: Cache key
@@ -183,6 +195,7 @@ jobs:
           NADAPT: ${{ steps.matrix.outputs.nadapt }}
           DRAWS: ${{ steps.matrix.outputs.draws }}
           SEGMENTED: ${{ steps.matrix.outputs.segmented }}
+          NSEG: ${{ steps.matrix.outputs.nseg }}
           SEGLEN: ${{ steps.matrix.outputs.seglen }}
           BURNIN: ${{ steps.matrix.outputs.burnin }}
           UNITS: ${{ steps.matrix.outputs.units }}
@@ -193,7 +206,7 @@ jobs:
             echo "- drugs: ${IN_DRUGS}"
             echo "- designs: ${IN_DESIGNS}"
             echo "- chains: ${NCHAINS}, parts per chain: ${PARTS}, nadapt: ${NADAPT}, draws per part: ${DRAWS}, burn-in per part: ${BURNIN}"
-            if [ "$SEGMENTED" = "true" ]; then echo "- warmup: two jobs per chain (segments of ${SEGLEN} iterations)"; else echo "- warmup: one job per chain"; fi
+            if [ "$SEGMENTED" = "true" ]; then echo "- warmup: ${NSEG} chained jobs per chain (segments of ${SEGLEN} iterations)"; else echo "- warmup: one job per chain"; fi
             echo "- unit subsample: ${UNITS:-none (full data)}"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -251,10 +264,13 @@ jobs:
       - name: Init
         env:
           UNITS: ${{ needs.prep.outputs.units }}
+          MODEL: ${{ needs.prep.outputs.model }}
+          WANING: ${{ needs.prep.outputs.waning }}
         run: |
           DIR="stage/${DRUG}_${DESIGN}"
           mkdir -p "$DIR"
-          extra=()
+          extra=("--model=$MODEL")
+          if [ "$WANING" = "true" ]; then extra+=("--waning"); fi
           if [ -n "$UNITS" ]; then extra+=("--units=$UNITS"); fi
           julia --project=. -t 4 scripts/fit_stage.jl init "$DRUG" "$DESIGN" --out="$DIR" "${extra[@]}"
 
@@ -344,7 +360,7 @@ jobs:
       - name: Instantiate
         run: julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
 
-      # Segmented: segment 1 of 2 (iterations 1..seglen), writes the resumable state warmup_K_1. Otherwise (seglen 0, or
+      # Segmented: segment 1 of nseg (iterations 1..seglen), writes the resumable state warmup_K_1. Otherwise (seglen 0, or
       # seglen >= nadapt) one job does the whole warmup and writes warm_K.
       - name: Warmup
         run: |
@@ -387,10 +403,12 @@ jobs:
 
   warmup2:
     name: warmup2 ${{ matrix.drug }} ${{ matrix.design }} c${{ matrix.chain }}
-    # Segment 2 of 2. Only when warmup is segmented (seglen > 0 and seglen < nadapt). Needs the whole warmup matrix
-    # (no per-element dependency); a chain whose segment 1 failed fails fast on the download below.
+    # Segment 2 of NSEG (2 = 2..4; segment 1 is the `warmup` job). Runs only when the warmup has at least 2 segments
+    # (seglen > 0, nseg = ceil(nadapt / seglen) <= 4). Needs the whole previous matrix (no per-element dependency); a chain
+    # whose previous segment failed fails fast on the download below. The segment that reaches nadapt writes the final
+    # warm_K state (artifact warm-...-K); earlier ones write the resumable warmup_K_S state (artifact warmseg-...-K-2).
     needs: [prep, warmup]
-    if: ${{ !cancelled() && needs.prep.result == 'success' && needs.prep.outputs.segmented == 'true' && needs.warmup.result != 'skipped' }}
+    if: ${{ !cancelled() && needs.prep.result == 'success' && fromJSON(needs.prep.outputs.nseg) >= 2 && needs.warmup.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 330
     strategy:
@@ -402,8 +420,9 @@ jobs:
       DESIGN: ${{ matrix.design }}
       CHAIN: ${{ matrix.chain }}
       NADAPT: ${{ needs.prep.outputs.nadapt }}
-      SEGMENTED: ${{ needs.prep.outputs.segmented }}
+      NSEG: ${{ needs.prep.outputs.nseg }}
       SEGLEN: ${{ needs.prep.outputs.seglen }}
+      SEG: '2'
     steps:
       - name: Require STAGE_KEY
         run: |
@@ -465,19 +484,267 @@ jobs:
       - name: Warmup segment 2
         run: |
           julia --project=. -t 4 scripts/fit_stage.jl warmup "$DRUG" "$DESIGN" \
-            --chain="$CHAIN" --dir="stage/${DRUG}_${DESIGN}" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg=2
+            --chain="$CHAIN" --dir="stage/${DRUG}_${DESIGN}" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg="$SEG"
+          if [ "$SEG" = "$NSEG" ]; then
+            echo "WARM_FILE=warm_${CHAIN}.jld2" >> "$GITHUB_ENV"
+          else
+            echo "WARM_FILE=warmup_${CHAIN}_${SEG}.jld2" >> "$GITHUB_ENV"
+          fi
 
       - name: Encrypt warmup state
-        run: openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:STAGE_KEY -in "stage/${DRUG}_${DESIGN}/warm_${CHAIN}.jld2" -out "stage/${DRUG}_${DESIGN}/warm_${CHAIN}.jld2.enc"
+        run: openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:STAGE_KEY -in "stage/${DRUG}_${DESIGN}/${WARM_FILE}" -out "stage/${DRUG}_${DESIGN}/${WARM_FILE}.enc"
 
       - name: Check upload
-        run: julia scripts/ci_check_upload.jl --kind=stage --max-mb=50 "stage/${DRUG}_${DESIGN}/warm_${CHAIN}.jld2.enc"
+        run: julia scripts/ci_check_upload.jl --kind=stage --max-mb=50 "stage/${DRUG}_${DESIGN}/${WARM_FILE}.enc"
 
-      - name: Upload encrypted warmup state
+      - name: Upload encrypted warmup state (final segment)
+        if: env.SEG == env.NSEG
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: warm-${{ matrix.drug }}-${{ matrix.design }}-${{ matrix.chain }}
-          path: stage/${{ matrix.drug }}_${{ matrix.design }}/warm_${{ matrix.chain }}.jld2.enc
+          path: stage/${{ matrix.drug }}_${{ matrix.design }}/${{ env.WARM_FILE }}.enc
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
+
+      - name: Upload encrypted warmup segment 2
+        if: env.SEG != env.NSEG
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: warmseg-${{ matrix.drug }}-${{ matrix.design }}-${{ matrix.chain }}-2
+          path: stage/${{ matrix.drug }}_${{ matrix.design }}/${{ env.WARM_FILE }}.enc
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
+
+  warmup3:
+    name: warmup3 ${{ matrix.drug }} ${{ matrix.design }} c${{ matrix.chain }}
+    # Segment 3 of NSEG (3 = 2..4; segment 1 is the `warmup` job). Runs only when the warmup has at least 3 segments
+    # (seglen > 0, nseg = ceil(nadapt / seglen) <= 4). Needs the whole previous matrix (no per-element dependency); a chain
+    # whose previous segment failed fails fast on the download below. The segment that reaches nadapt writes the final
+    # warm_K state (artifact warm-...-K); earlier ones write the resumable warmup_K_S state (artifact warmseg-...-K-3).
+    needs: [prep, warmup2]
+    if: ${{ !cancelled() && needs.prep.result == 'success' && fromJSON(needs.prep.outputs.nseg) >= 3 && needs.warmup2.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prep.outputs.matrix_warmup) }}
+    env:
+      STAGE_KEY: ${{ secrets.STAGE_KEY }}
+      DRUG: ${{ matrix.drug }}
+      DESIGN: ${{ matrix.design }}
+      CHAIN: ${{ matrix.chain }}
+      NADAPT: ${{ needs.prep.outputs.nadapt }}
+      NSEG: ${{ needs.prep.outputs.nseg }}
+      SEGLEN: ${{ needs.prep.outputs.seglen }}
+      SEG: '3'
+    steps:
+      - name: Require STAGE_KEY
+        run: |
+          if [ -z "$STAGE_KEY" ]; then
+            echo "::error::repository secret STAGE_KEY is not set. Create it with: openssl rand -base64 48 | gh secret set STAGE_KEY"
+            exit 1
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Download encrypted init state
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: init-${{ matrix.drug }}-${{ matrix.design }}
+          path: stage/${{ matrix.drug }}_${{ matrix.design }}
+
+      - name: Download encrypted warmup segment 2 of this chain
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: warmseg-${{ matrix.drug }}-${{ matrix.design }}-${{ matrix.chain }}-2
+          path: stage/${{ matrix.drug }}_${{ matrix.design }}
+
+      - name: Decrypt stage files
+        run: |
+          for f in "stage/${DRUG}_${DESIGN}"/*.enc; do
+            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:STAGE_KEY -in "$f" -out "${f%.enc}"
+            rm "$f"
+          done
+
+      - name: Download encrypted PDXE tables
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pdxe-data
+          path: ${{ runner.temp }}/pdxe-data
+
+      - name: Decrypt PDXE tables
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:STAGE_KEY -in "$RUNNER_TEMP/pdxe-data/data-cache.tgz.enc" | tar -xz -C data
+          ls -l data/cache/pct_long.csv data/cache/pct_metrics.csv
+
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2.7.0
+        with:
+          version: '1.10'
+
+      - name: Restore Julia depot
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.julia/packages
+            ~/.julia/artifacts
+            ~/.julia/compiled
+            ~/.julia/scratchspaces
+          key: ${{ needs.prep.outputs.depot_key }}
+
+      - name: Instantiate
+        run: julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+
+      - name: Warmup segment 3
+        run: |
+          julia --project=. -t 4 scripts/fit_stage.jl warmup "$DRUG" "$DESIGN" \
+            --chain="$CHAIN" --dir="stage/${DRUG}_${DESIGN}" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg="$SEG"
+          if [ "$SEG" = "$NSEG" ]; then
+            echo "WARM_FILE=warm_${CHAIN}.jld2" >> "$GITHUB_ENV"
+          else
+            echo "WARM_FILE=warmup_${CHAIN}_${SEG}.jld2" >> "$GITHUB_ENV"
+          fi
+
+      - name: Encrypt warmup state
+        run: openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:STAGE_KEY -in "stage/${DRUG}_${DESIGN}/${WARM_FILE}" -out "stage/${DRUG}_${DESIGN}/${WARM_FILE}.enc"
+
+      - name: Check upload
+        run: julia scripts/ci_check_upload.jl --kind=stage --max-mb=50 "stage/${DRUG}_${DESIGN}/${WARM_FILE}.enc"
+
+      - name: Upload encrypted warmup state (final segment)
+        if: env.SEG == env.NSEG
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: warm-${{ matrix.drug }}-${{ matrix.design }}-${{ matrix.chain }}
+          path: stage/${{ matrix.drug }}_${{ matrix.design }}/${{ env.WARM_FILE }}.enc
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
+
+      - name: Upload encrypted warmup segment 3
+        if: env.SEG != env.NSEG
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: warmseg-${{ matrix.drug }}-${{ matrix.design }}-${{ matrix.chain }}-3
+          path: stage/${{ matrix.drug }}_${{ matrix.design }}/${{ env.WARM_FILE }}.enc
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
+
+  warmup4:
+    name: warmup4 ${{ matrix.drug }} ${{ matrix.design }} c${{ matrix.chain }}
+    # Segment 4 of NSEG (4 = 2..4; segment 1 is the `warmup` job). Runs only when the warmup has at least 4 segments
+    # (seglen > 0, nseg = ceil(nadapt / seglen) <= 4). Needs the whole previous matrix (no per-element dependency); a chain
+    # whose previous segment failed fails fast on the download below. The segment that reaches nadapt writes the final
+    # warm_K state (artifact warm-...-K); earlier ones write the resumable warmup_K_S state (artifact warmseg-...-K-4).
+    needs: [prep, warmup3]
+    if: ${{ !cancelled() && needs.prep.result == 'success' && fromJSON(needs.prep.outputs.nseg) >= 4 && needs.warmup3.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prep.outputs.matrix_warmup) }}
+    env:
+      STAGE_KEY: ${{ secrets.STAGE_KEY }}
+      DRUG: ${{ matrix.drug }}
+      DESIGN: ${{ matrix.design }}
+      CHAIN: ${{ matrix.chain }}
+      NADAPT: ${{ needs.prep.outputs.nadapt }}
+      NSEG: ${{ needs.prep.outputs.nseg }}
+      SEGLEN: ${{ needs.prep.outputs.seglen }}
+      SEG: '4'
+    steps:
+      - name: Require STAGE_KEY
+        run: |
+          if [ -z "$STAGE_KEY" ]; then
+            echo "::error::repository secret STAGE_KEY is not set. Create it with: openssl rand -base64 48 | gh secret set STAGE_KEY"
+            exit 1
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Download encrypted init state
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: init-${{ matrix.drug }}-${{ matrix.design }}
+          path: stage/${{ matrix.drug }}_${{ matrix.design }}
+
+      - name: Download encrypted warmup segment 3 of this chain
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: warmseg-${{ matrix.drug }}-${{ matrix.design }}-${{ matrix.chain }}-3
+          path: stage/${{ matrix.drug }}_${{ matrix.design }}
+
+      - name: Decrypt stage files
+        run: |
+          for f in "stage/${DRUG}_${DESIGN}"/*.enc; do
+            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:STAGE_KEY -in "$f" -out "${f%.enc}"
+            rm "$f"
+          done
+
+      - name: Download encrypted PDXE tables
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pdxe-data
+          path: ${{ runner.temp }}/pdxe-data
+
+      - name: Decrypt PDXE tables
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:STAGE_KEY -in "$RUNNER_TEMP/pdxe-data/data-cache.tgz.enc" | tar -xz -C data
+          ls -l data/cache/pct_long.csv data/cache/pct_metrics.csv
+
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2.7.0
+        with:
+          version: '1.10'
+
+      - name: Restore Julia depot
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.julia/packages
+            ~/.julia/artifacts
+            ~/.julia/compiled
+            ~/.julia/scratchspaces
+          key: ${{ needs.prep.outputs.depot_key }}
+
+      - name: Instantiate
+        run: julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+
+      - name: Warmup segment 4
+        run: |
+          julia --project=. -t 4 scripts/fit_stage.jl warmup "$DRUG" "$DESIGN" \
+            --chain="$CHAIN" --dir="stage/${DRUG}_${DESIGN}" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg="$SEG"
+          if [ "$SEG" = "$NSEG" ]; then
+            echo "WARM_FILE=warm_${CHAIN}.jld2" >> "$GITHUB_ENV"
+          else
+            echo "WARM_FILE=warmup_${CHAIN}_${SEG}.jld2" >> "$GITHUB_ENV"
+          fi
+
+      - name: Encrypt warmup state
+        run: openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:STAGE_KEY -in "stage/${DRUG}_${DESIGN}/${WARM_FILE}" -out "stage/${DRUG}_${DESIGN}/${WARM_FILE}.enc"
+
+      - name: Check upload
+        run: julia scripts/ci_check_upload.jl --kind=stage --max-mb=50 "stage/${DRUG}_${DESIGN}/${WARM_FILE}.enc"
+
+      - name: Upload encrypted warmup state (final segment)
+        if: env.SEG == env.NSEG
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: warm-${{ matrix.drug }}-${{ matrix.design }}-${{ matrix.chain }}
+          path: stage/${{ matrix.drug }}_${{ matrix.design }}/${{ env.WARM_FILE }}.enc
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
+
+      - name: Upload encrypted warmup segment 4
+        if: env.SEG != env.NSEG
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: warmseg-${{ matrix.drug }}-${{ matrix.design }}-${{ matrix.chain }}-4
+          path: stage/${{ matrix.drug }}_${{ matrix.design }}/${{ env.WARM_FILE }}.enc
           if-no-files-found: error
           retention-days: 3
           overwrite: true
@@ -485,9 +752,9 @@ jobs:
   sample:
     name: sample ${{ matrix.drug }} ${{ matrix.design }} c${{ matrix.chain }} p${{ matrix.part }}
     # GitHub cannot depend on single matrix elements, so this waits for every warmup (and warmup2, which is skipped
-    # when warmup is not segmented) job. The warm state comes from whichever job produced the artifact warm-...-K.
+    # when the warmup has fewer segments) job. The warm state comes from whichever job produced the artifact warm-...-K.
     # Combinations whose warmup failed fail fast on the artifact download below.
-    needs: [prep, warmup, warmup2]
+    needs: [prep, warmup, warmup2, warmup3, warmup4]
     if: ${{ !cancelled() && needs.prep.result == 'success' && needs.warmup.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 330
@@ -595,6 +862,7 @@ jobs:
       DESIGN: ${{ matrix.design }}
       NCHAINS: ${{ needs.prep.outputs.nchains }}
       PARTS: ${{ needs.prep.outputs.parts }}
+      SUFFIX: ${{ needs.prep.outputs.suffix }}
     steps:
       - name: Require STAGE_KEY
         run: |
@@ -680,18 +948,18 @@ jobs:
       # The merged fit is the only thing uploaded in clear. The check verifies its structure (field allow-list,
       # no baseline coordinates or raw chain arrays, no constant baselines) as well as sizes and data column names.
       - name: Check upload
-        run: julia --project=. scripts/ci_check_upload.jl --kind=fit --max-mb=500 "fits/${DRUG}_${DESIGN}.jld2" "fits/${DRUG}_${DESIGN}_diagnostics.md"
+        run: julia --project=. scripts/ci_check_upload.jl --kind=fit --max-mb=500 "fits/${DRUG}_${DESIGN}${SUFFIX}.jld2" "fits/${DRUG}_${DESIGN}${SUFFIX}_diagnostics.md"
 
       - name: Diagnostics in job summary
-        run: cat "fits/${DRUG}_${DESIGN}_diagnostics.md" >> "$GITHUB_STEP_SUMMARY"
+        run: cat "fits/${DRUG}_${DESIGN}${SUFFIX}_diagnostics.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload merged fit
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: fit-${{ matrix.drug }}-${{ matrix.design }}
+          name: fit-${{ matrix.drug }}-${{ matrix.design }}${{ needs.prep.outputs.suffix }}
           path: |
-            fits/${{ matrix.drug }}_${{ matrix.design }}.jld2
-            fits/${{ matrix.drug }}_${{ matrix.design }}_diagnostics.md
+            fits/${{ matrix.drug }}_${{ matrix.design }}${{ needs.prep.outputs.suffix }}.jld2
+            fits/${{ matrix.drug }}_${{ matrix.design }}${{ needs.prep.outputs.suffix }}_diagnostics.md
           if-no-files-found: error
           retention-days: 90
           overwrite: true

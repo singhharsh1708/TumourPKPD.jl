@@ -623,3 +623,100 @@ end
     @test TP.assert_public_output(bins = ok_bins) === nothing
     @test TP.public_output_violations(summaries = [(n_pdx = 4,)], min_pdx = 3) == String[]
 end
+
+# ---------------------------------------------------------------- v2 fits: correlated effects, per-PDX Vtr, waning
+@testset "v2 model and waning" begin
+    # ---- v1 is unchanged: a "model" => "v1" key gives exactly the stream without the key
+    pd, doses = synth_pd(S = 8, nm = 5)
+    tg = [0.0, 7.0, 14.0, 28.0]
+    a = TP.simulate_regimen(pd, doses; newpdx = true, tgrid = tg, ndraws = 8, rng = MersenneTwister(3))
+    pd.diagnostics["model"] = "v1"; pd.diagnostics["waning"] = false
+    b = TP.simulate_regimen(pd, doses; newpdx = true, tgrid = tg, ndraws = 8, rng = MersenneTwister(3))
+    @test a == b
+    d1 = TP.simulate_regimen(pd, doses; newpdx = true, tgrid = tg, draws = repeat([1], 3000), rng = MersenneTwister(4), obs_noise = false, details = true)
+    @test abs(cor(log.(d1.λ0), log.(d1.k2))) < 0.06                                     # independent effects
+    @test all(d1.λ1 .== exp(pd.logλ1[1]))                                                # pooled λ1
+    # ---- v2 new PDX: correlation, Vtr and independence reproduce the target (Monte Carlo)
+    S = 4
+    v2, _ = synth_pd(S = S, nm = 5, ωl = 0.4, ωk = 0.7)
+    ρs = [-0.6, 0.0, 0.5, 0.85]
+    v2.diagnostics["model"] = "v2"; v2.diagnostics["corr_lk"] = ρs
+    v2.diagnostics["mu_logVtr"] = fill(log(500.0), S); v2.diagnostics["omega_Vtr"] = fill(0.5, S)
+    v2.diagnostics["lambda1_draws"] = fill(123.0, S, 5)
+    n = 4000
+    r = TP.simulate_regimen(v2, doses; newpdx = true, tgrid = [0.0, 1.0], draws = repeat(1:S, inner = n), obs_noise = false,
+                            rng = MersenneTwister(11), details = true)
+    for s in 1:S
+        rows = (s - 1) * n + 1:s * n
+        llam0 = log.(r.λ0[rows]); lk2 = log.(r.k2[rows]); lvtr = log.(r.λ1[rows]) .- llam0
+        @test cor(llam0, lk2) ≈ ρs[s] atol = 0.045
+        @test isapprox(std(llam0), 0.4; rtol = 0.05) && isapprox(std(lk2), 0.7; rtol = 0.05)
+        @test isapprox(mean(llam0), v2.μ_λ0[s]; atol = 0.03) && isapprox(mean(lk2), v2.μ_k2[s]; atol = 0.04)
+        @test isapprox(mean(lvtr), log(500.0); atol = 0.03) && isapprox(std(lvtr), 0.5; rtol = 0.05)   # λ1 = λ0·Vtr_i, Vtr_i ~ logN
+        @test abs(cor(lvtr, llam0)) < 0.05 && abs(cor(lvtr, lk2)) < 0.05                    # Vtr independent of (λ0, k2)
+    end
+    # seeded reproducibility of the v2 stream
+    r2 = TP.simulate_regimen(v2, doses; newpdx = true, tgrid = [0.0, 1.0], draws = repeat(1:S, inner = n), obs_noise = false, rng = MersenneTwister(11), details = true)
+    @test r2.y == r.y && r2.λ1 == r.λ1
+    # ---- known PDX in a v2 fit: the model's own prediction (pointwise log-likelihood of the hierarchical model)
+    rng = MersenneTwister(31); N = 4; S = 6
+    ddoses = dosing_schedule(10.0; start = 0.0, interval = 1.0, n = 45)
+    pk = OneCmt(CL = 20.0, V = 5.0, ka = 8.0, F = 0.8)
+    cref = maximum(conc(pk, ddoses, 0:0.1:7))
+    truth = (μ_λ0 = log(0.1), ω_λ0 = 0.3, μ_k2 = log(0.3), ω_k2 = 0.6, logλ1 = log(100.0), logk1 = log(0.7), σ = 0.15)
+    units, _ = TP.simulate_units(rng, N, ddoses, pk, cref; truth)
+    for waning in (false, true)
+        λ0 = 0.06 .+ 0.06 .* rand(rng, S, N); k2 = 0.1 .+ 0.5 .* rand(rng, S, N); λ1m = 40.0 .+ 120.0 .* rand(rng, S, N)
+        w0c = 150.0 .+ 60.0 .* rand(rng, S, N); w0t = 150.0 .+ 60.0 .* rand(rng, S, N)
+        logk1 = log(0.7) .+ 0.1 .* randn(rng, S); ρw = 0.02 .+ 0.04 .* rand(rng, S)
+        dg = Dict{String,Any}("settings" => Dict{String,Any}("lod" => 4.0, "nu" => 5.0, "nchains" => 1), "nu" => 5.0, "model" => "v2",
+                              "lambda1_draws" => λ1m, "corr_lk" => fill(0.3, S), "mu_logVtr" => fill(log(500.0), S), "omega_Vtr" => fill(0.5, S),
+                              "waning" => waning, "waning_rate" => waning ? ρw : Float64[])
+        pdk = PD("t", [u.model for u in units], ddoses, fill(pk, S), cref, fill(log(0.1), S), fill(0.3, S), fill(log(0.3), S), fill(0.6, S),
+                 fill(log(100.0), S), logk1, fill(0.15, S), λ0, k2, vec(median(w0c; dims = 1)), vec(median(w0t; dims = 1)), w0c, w0t, dg)
+        ll = TP.pointwise_loglik(pdk, units; threaded = false)
+        idx = TP.pointwise_index(units)
+        dist = TDist(5.0)
+        ncheck = 0
+        for (m, u) in enumerate(units), arm in (:treated, :control)
+            c = arm === :treated ? u.treated : u.control
+            cols = [i for i in eachindex(idx.t) if idx.group[i] == m && idx.arm[i] === arm && !idx.censored[i]]
+            tt = idx.t[cols]
+            w = arm === :treated ?
+                TP.simulate_regimen(pdk, ddoses; model = u.model, tgrid = tt, w0 = w0t[:, m], draws = 1:S, obs_noise = false, rtol = 1e-5, atol = 1e-5) :
+                TP.simulate_control(pdk; model = u.model, tgrid = tt, w0 = w0c[:, m], draws = 1:S, obs_noise = false, rtol = 1e-5, atol = 1e-5)
+            for (q, col) in enumerate(cols), s in 1:S
+                y = c.v[findfirst(==(tt[q]), c.t)]
+                expected = logpdf(dist, (log(y) - log(max(w[s, q], 1e-3))) / 0.15) - log(0.15)
+                @test ll[s, col] ≈ expected atol = 1e-4
+                ncheck += 1
+            end
+        end
+        @test ncheck > 100
+        # the stored λ1 and (if present) the waning rate really enter the prediction
+        base = TP.simulate_regimen(pdk, ddoses; model = units[1].model, tgrid = [0.0, 20.0, 40.0], w0 = w0t[:, 1], draws = 1:S, obs_noise = false)
+        pdk.diagnostics["lambda1_draws"] = 0.02 .* λ1m
+        @test maximum(abs.(TP.simulate_regimen(pdk, ddoses; model = units[1].model, tgrid = [0.0, 20.0, 40.0], w0 = w0t[:, 1], draws = 1:S, obs_noise = false) .- base)) > 1.0
+        pdk.diagnostics["lambda1_draws"] = λ1m
+        if waning
+            pdk.diagnostics["waning"] = false
+            nowane = TP.simulate_regimen(pdk, ddoses; model = units[1].model, tgrid = [0.0, 20.0, 40.0], w0 = w0t[:, 1], draws = 1:S, obs_noise = false)
+            @test all(nowane[:, 3] .< base[:, 3])                                       # waning efficacy gives larger late volumes
+        end
+    end
+    # ---- waning lowers predicted response in the virtual trial; v2 trial runs through the same path
+    wp, wd = synth_pd(S = 20, μk = log(0.25))
+    nw = TP.simulate_trial(wp, wd; n_pdx = 150, ndraws = 20, rng = MersenneTwister(2)).summary.responder_rate.median
+    wp.diagnostics["waning"] = true; wp.diagnostics["waning_rate"] = fill(0.15, 20)
+    ww = TP.simulate_trial(wp, wd; n_pdx = 150, ndraws = 20, rng = MersenneTwister(2)).summary.responder_rate.median
+    @test ww < nw - 0.05
+    wp.diagnostics["model"] = "v2"; wp.diagnostics["corr_lk"] = fill(0.5, 20); wp.diagnostics["mu_logVtr"] = fill(log(1000.0), 20)
+    wp.diagnostics["omega_Vtr"] = fill(0.5, 20); wp.diagnostics["lambda1_draws"] = fill(120.0, 20, 30)
+    tv2 = TP.simulate_trial(wp, wd; n_pdx = 50, ndraws = 10, rng = MersenneTwister(2))
+    @test size(tv2.categories) == (50, 10) && tv2.n_na == 0
+    # convergence summary includes the v2 hyperparameters
+    wp.diagnostics["nchains"] = 4; wp.diagnostics["waning_rate"] = exp.(0.1 .* randn(MersenneTwister(3), 20))
+    wp.diagnostics["corr_lk"] = 0.5 .+ 0.1 .* randn(MersenneTwister(4), 20)
+    cs = TP.convergence_summary(wp)
+    @test cs.recomputed !== nothing && "corr(log λ0, log k2)" in cs.recomputed.names && "waning rate" in cs.recomputed.names
+end

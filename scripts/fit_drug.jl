@@ -2,7 +2,7 @@
 #
 #   julia --project=. -t 4 scripts/fit_drug.jl <drug> <full|late|holdout> [nchains warmup draws] [--seed=1] [--units=N]
 #                                                [--target=0.8] [--window=42] [--nu=5] [--baseline-sd=0.1]
-#                                                [--cthreads=2] [--mapstarts=5] [--mapiters=1000] [--nolatent] [--noprocs] [--out=fits]
+#                                                [--cthreads=2] [--mapstarts=5] [--mapiters=1000] [--nolatent] [--noprocs] [--out=fits] [--model=v1|v2] [--waning]
 #
 #   full     all PDX models, all points                       -> fits/<drug>.jld2
 #   late     every curve cut with split_late(frac=0.3)         -> fits/<drug>_late.jld2
@@ -52,10 +52,11 @@ function parse_cli(args)
         end
     end
     length(pos) >= 2 || error("usage: fit_drug.jl <drug> <full|late|holdout> [nchains warmup draws] [--seed=1] [--units=N] [--target=0.8] [--window=42] [--nu=5] [--baseline-sd=0.1]
-#                                                [--cthreads=2] [--mapstarts=5] [--mapiters=1000] [--nolatent] [--noprocs] [--out=fits]")
+#                                                [--cthreads=2] [--mapstarts=5] [--mapiters=1000] [--nolatent] [--noprocs] [--out=fits] [--model=v1|v2] [--waning]")
     return pos, opts
 end
 
+getopt_(o, k, d) = get(o, k, d)
 const TAG = Ref("")
 stamp(msg) = println("[", Dates.format(now(), "HH:MM:SS"), "]", TAG[], " ", msg)
 
@@ -69,6 +70,9 @@ function main(args)
     seed    = parse(Int, get(opts, "seed", "1"))
     target  = parse(Float64, get(opts, "target", "0.8"))
     latent  = !haskey(opts, "nolatent")
+    model   = getopt_(opts, "model", "v1"); model in ("v1", "v2") || error("--model must be v1 or v2")
+    waning  = haskey(opts, "waning") && opts["waning"] != "false"
+    mode_gap = parse(Float64, get(opts, "mode-gap", model == "v2" ? "30" : "Inf"))   # v2 production default 30
     outdir  = abspath(get(opts, "out", joinpath(ROOT, "fits")))
     window  = parse(Float64, get(opts, "window", mode == "late21" ? "21" : "42"))
     nu      = parse(Float64, get(opts, "nu", "5"))
@@ -135,6 +139,7 @@ function main(args)
     end
 
     kw = (; drug, nsamples = ndraws, nadapt, target_accept = target, latent_w0 = latent, split, cutoffs, seed,
+          model = Symbol(model), waning, mode_gap,
           window_days = window, nu, baseline_sd = bsd)
     chain_only = haskey(opts, "chain-only")
     if chain_only                                  # child process: one chain from the shared start, save it, done
@@ -152,13 +157,13 @@ function main(args)
         init_file = ""
         map_lps = nothing
         k2c = nothing
-        mode_idx = nothing; mode_lps = nothing
+        mode_idx = nothing; mode_lps = nothing; excluded = nothing
         if mapstarts > 0
             stamp("multi-start MAP: $mapstarts starts, <= $mapiters iterations each")
             mm = M.map_modes(train, doses, pk, cref; window_days = window, nu, baseline_sd = bsd,
-                             latent_w0 = latent, nstarts = mapstarts, maxiters = mapiters,
+                             latent_w0 = latent, nstarts = mapstarts, maxiters = mapiters, model_v2 = model == "v2", waning, mode_gap,
                              rng = MersenneTwister(seed), logger = stamp)
-            map_lps = mm.all_lps; k2c = mm.k2_centered
+            map_lps = mm.all_lps; k2c = mm.k2_centered; excluded = mm.excluded
             mode_idx = [mod1(k, length(mm.starts)) for k in 1:nchains]; mode_lps = [m.lp for m in mm.starts]
             stamp("MAP log-densities of all starts: " * join(round.(map_lps; digits = 1), ", ") *
                   "; $(length(mm.starts)) distinct mode(s), best " * string(round(maximum(map_lps); digits = 1)) *
@@ -170,6 +175,7 @@ function main(args)
                            "--window=$window", "--nu=$nu", "--baseline-sd=$bsd", "--mapstarts=$mapstarts"]
         isempty(init_file) || push!(childargs, "--init-file=" * init_file)
         latent || push!(childargs, "--nolatent")
+        push!(childargs, "--model=$model", "--mode-gap=$mode_gap"); waning && push!(childargs, "--waning")
         haskey(opts, "units") && push!(childargs, "--units=" * opts["units"])
         maxprocs = max(1, Threads.nthreads() ÷ cthreads)
         stamp("sampling $nchains chains in separate processes ($cthreads thread(s) each, max $maxprocs at a time)")
@@ -179,7 +185,7 @@ function main(args)
                        worker_processes = true)
         _, pd = M.fit_drug(train, doses, pk, cref; kw..., precomputed_chain = chain, precomputed_runtime = wall,
                            map_lps, worker_info, k2_centered = k2c,
-                           chain_start_modes = mode_idx, distinct_mode_lps = mode_lps)
+                           chain_start_modes = mode_idx, distinct_mode_lps = mode_lps, excluded_modes = excluded)
     else
         _, pd = M.fit_drug(train, doses, pk, cref; kw..., nchains, rng = MersenneTwister(seed), log_every = 25, logger = stamp,
                            map_starts = mapstarts, map_maxiters = mapiters)

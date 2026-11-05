@@ -8,15 +8,41 @@ function _draw_indices(rng, nall::Int, n::Int)
     return sort!(randperm(rng, nall)[1:n])
 end
 
-# Per-row PDX parameters (λ0, k2, λ1) of stored draw `i`: a known model `j` uses its own stored λ0/k2 and the draw's
-# pooled λ1; a new PDX draws fresh effects (independent log-normal λ0, k2 from `z1`, `z2`) with the draw's pooled λ1.
-# This is the single place to change when the fits gain correlated (log λ0, log k2) effects or a per-PDX transition
-# volume (then use the bivariate draw and λ1 = λ0·Vtr_i).
-@inline function _row_params(pd, i, j, newpdx::Bool, z1, z2)
+# Model-version context of a fit. v1 (no "model" key, or "v1"): independent log-normal (λ0, k2) effects and one pooled λ1 per
+# draw (`pd.logλ1`). v2 (`diagnostics["model"] == "v2"`): corr(log λ0, log k2) = `corr_lk` per draw, and a per-PDX transition
+# volume, λ1_i = λ0_i·Vtr_i with log Vtr_i ~ N(`mu_logVtr`, `omega_Vtr`) per draw (stored per known PDX in `lambda1_draws`,
+# ndraw × nmodel). Optional waning efficacy (`waning`, `waning_rate` per draw): treated exposure × exp(-ρ_w t).
+function _model_ctx(pd)
+    v2 = _fit_meta(pd, "model", "v1") == "v2"
+    wn = Bool(_fit_meta(pd, "waning", false))
+    return (v2 = v2, waning = wn,
+            λ1mat = v2 ? _fit_meta(pd, "lambda1_draws") : nothing, corr = v2 ? _fit_meta(pd, "corr_lk") : nothing,
+            μV = v2 ? _fit_meta(pd, "mu_logVtr") : nothing, ωV = v2 ? _fit_meta(pd, "omega_Vtr") : nothing,
+            ρw = wn ? _fit_meta(pd, "waning_rate") : nothing)
+end
+
+# Treated exposure of stored draw `i` (waning efficacy if the fit has it).
+function _treated_exposure(pd, ctx, i, ds)
+    e = PKExposure(pd.pk[i], ds, pd.cref)
+    return ctx.waning ? WaningExposure(e, ctx.ρw[i]) : e
+end
+
+# Per-row PDX parameters (λ0, k2, λ1) of stored draw `i`. Known model `j`: its own stored λ0/k2 and, in v2, its stored λ1
+# (`lambda1_draws[i, j]`), else the draw's pooled λ1. New PDX: fresh effects `z1, z2, z3 ~ N(0,1)`;
+#   v1: log λ0 = μ_λ0 + ω_λ0 z1, log k2 = μ_k2 + ω_k2 z2, λ1 pooled;
+#   v2: log λ0 = μ_λ0 + ω_λ0 z1, log k2 = μ_k2 + ω_k2 (ρ z1 + √(1-ρ²) z2), log λ1 = log λ0 + μ_logVtr + ω_Vtr z3
+# (the construction of `marginal_unit_loglik`).
+@inline function _row_params(pd, ctx, i, j, newpdx::Bool, z1, z2, z3)
     if newpdx
-        return (exp(pd.μ_λ0[i] + pd.ω_λ0[i] * z1), exp(pd.μ_k2[i] + pd.ω_k2[i] * z2), exp(pd.logλ1[i]))
+        llam0 = pd.μ_λ0[i] + pd.ω_λ0[i] * z1
+        if ctx.v2
+            ρ = ctx.corr[i]
+            return (exp(llam0), exp(pd.μ_k2[i] + pd.ω_k2[i] * (ρ * z1 + sqrt(1 - ρ^2) * z2)),
+                    exp(llam0 + ctx.μV[i] + ctx.ωV[i] * z3))
+        end
+        return (exp(llam0), exp(pd.μ_k2[i] + pd.ω_k2[i] * z2), exp(pd.logλ1[i]))
     end
-    return (pd.λ0[i, j], pd.k2[i, j], exp(pd.logλ1[i]))
+    return (pd.λ0[i, j], pd.k2[i, j], ctx.v2 ? ctx.λ1mat[i, j] : exp(pd.logλ1[i]))
 end
 
 # Core: returns (y, idx, σ, λ0, k2) for the selected draws. `mkexpo(i)` builds the
@@ -45,6 +71,8 @@ function _simulate(pd, mkexpo, w0, w0mat::Matrix{Float64}, tgrid, ndraws, model,
     # All random numbers are drawn serially so results do not depend on thread count.
     zλ = newpdx ? randn(rng, n) : Float64[]
     zk = newpdx ? randn(rng, n) : Float64[]
+    ctx = _model_ctx(pd)
+    zv = (newpdx && ctx.v2) ? randn(rng, n) : Float64[]        # v2 only: after zλ, zk, so v1 streams are unchanged
     pool = if newpdx
         baseline_models === nothing ? collect(1:length(pd.models)) :
             [(j = findfirst(==(String(m)), pd.models); j === nothing &&
@@ -75,7 +103,7 @@ function _simulate(pd, mkexpo, w0, w0mat::Matrix{Float64}, tgrid, ndraws, model,
     k2 = Vector{Float64}(undef, n)
     λ1 = Vector{Float64}(undef, n)
     for r in 1:n
-        λ0[r], k2[r], λ1[r] = _row_params(pd, idx[r], j, newpdx, newpdx ? zλ[r] : 0.0, newpdx ? zk[r] : 0.0)
+        λ0[r], k2[r], λ1[r] = _row_params(pd, ctx, idx[r], j, newpdx, newpdx ? zλ[r] : 0.0, newpdx ? zk[r] : 0.0, isempty(zv) ? 0.0 : zv[r])
     end
 
     y = Matrix{Float64}(undef, n, nt)
@@ -97,7 +125,7 @@ function _simulate(pd, mkexpo, w0, w0mat::Matrix{Float64}, tgrid, ndraws, model,
             y[r, :] .= NaN
         end
     end
-    return (; y, idx, σ = pd.σ[idx], λ0, k2, w0 = w0s)
+    return (; y, idx, σ = pd.σ[idx], λ0, k2, λ1, w0 = w0s)
 end
 
 """
@@ -120,8 +148,14 @@ if given), i.e. the training set's baseline distribution. A user `w0` (scalar, o
 one entry per row) overrides both. `obs_noise=true` multiplies by noise
 `exp(σ ε)` at every `t > 0`, `ε ~ Student-t(ν)` with `ν = nu_from_fit(pd)` (the fit's `diagnostics["nu"]`, 5 if
 absent, `Inf` = Normal), i.e. the fitted observation model (the baseline is conditioned on). Rows whose ODE solve fails
-are filled with NaN. With `details=true` returns `(y, idx, σ, λ0, k2, w0)` where `idx` are the
+are filled with NaN. With `details=true` returns `(y, idx, σ, λ0, k2, λ1, w0)` where `idx` are the
 stored-draw indices used (needed for log predictive density with `obs_noise=false`).
+
+**Model versions.** Fits with `diagnostics["model"] == "v2"` use correlated (log λ0, log k2) effects and a per-PDX
+transition volume: a known PDX uses its stored `lambda1_draws[i, j]`; a new PDX draws `log λ0 = μ_λ0 + ω_λ0 z1`,
+`log k2 = μ_k2 + ω_k2 (ρ z1 + √(1-ρ²) z2)` with `ρ = corr_lk[i]` and `log λ1 = log λ0 + mu_logVtr[i] + omega_Vtr[i] z3`.
+Fits with `waning=true` multiply the treated exposure by `exp(-ρ_w t)` (`waning_rate[i]`). Without a `model` key the
+behaviour is exactly the v1 one (independent effects, pooled λ1), including the random-number stream.
 
 `draws` (a vector of stored-draw indices) overrides `ndraws`/random selection: pass the same
 `draws` for every PDX model so that row `s` is the same population draw everywhere (needed for
@@ -135,7 +169,8 @@ function simulate_regimen(pd, doses::AbstractVector{Dose}; model = nothing, w0 =
                           details::Bool = false, draws = nothing, baseline_models = nothing)
     ds = collect(Dose, doses)
     cref = pd.cref
-    mk = i -> PKExposure(pd.pk[i], ds, cref)
+    ctx = _model_ctx(pd)
+    mk = i -> _treated_exposure(pd, ctx, i, ds)
     r = _simulate(pd, mk, w0, pd.w0_treated_draws, tgrid, ndraws, model, newpdx, obs_noise, rng, rtol, atol,
                   draws, baseline_models)
     return details ? r : r.y
@@ -467,7 +502,8 @@ function simulate_trial(pd, doses::AbstractVector{Dose}; n_pdx::Integer = 200, n
     nall = length(pd.σ)
     idx = draws === nothing ? _draw_indices(rng, nall, min(Int(ndraws), nall)) : collect(Int, draws)
     nd = length(idx)
-    expo = Dict(i => PKExposure(pd.pk[i], ds, pd.cref) for i in unique(idx))
+    ctxt = _model_ctx(pd)
+    expo = Dict(i => _treated_exposure(pd, ctxt, i, ds) for i in unique(idx))
     rows = repeat(idx, inner = n_pdx)                       # row r*(n_pdx) block = draw r
     r = _simulate(pd, i -> expo[i], nothing, pd.w0_treated_draws, tg, length(rows), nothing, true, true,
                   rng, rtol, atol, rows, bm)

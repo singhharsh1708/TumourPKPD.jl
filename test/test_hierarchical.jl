@@ -1,4 +1,4 @@
-using Test, Random, Statistics
+using Test, Random, Statistics, Distributions
 using TumourPKPD
 using TumourPKPD: Dose, OneCmt, dosing_schedule, conc, PKExposure
 using Turing
@@ -340,9 +340,10 @@ using JLD2
         for alt in ((; drug = "BKM120"), (; design = "late21"), (; window = 21.0), (; models = ["a", "c"]), (; split = Dict("kind" => "primary", "seed" => 2, "holdout_models" => ["z"])),
                     (; priors = H.HierPriors(; μ_λ0 = (log(0.06), 0.5))), (; nu = 4.0), (; baseline_sd = 0.2), (; lod = 1.0),
                     (; doses = doses[1:end-1]), (; pk = OneCmt(CL = 3.1, V = 1.5, ka = 24.0, F = 0.8)), (; cref = cref * 1.01),
-                    (; k2_centered = [false, false]), (; centered_lam0 = false), (; latent_w0 = false), (; reltol = 1e-6), (; init_id = "abd"))
+                    (; k2_centered = [false, false]), (; centered_lam0 = false), (; latent_w0 = false), (; reltol = 1e-6), (; init_id = "abd"), (; mode_gap = 30.0))
             @test mkfp(; alt...) != fp0
         end
+        @test mkfp(; mode_gap = Inf) == fp0 && mkfp(; mode_gap = 30.0) != mkfp(; mode_gap = 20.0)   # Inf (no gap limit) keeps the old text
         @test H.verify_fingerprint(fp0, fp0) && H.verify_fingerprint(fp0, fp0; what = "x")
         err = try H.verify_fingerprint(fp0, mkfp(; nu = 4.0); what = "chain_1_1.jld2"); nothing catch e; e end
         @test err isa ErrorException && occursin("fingerprint mismatch", err.msg) && occursin("chain_1_1.jld2", err.msg)
@@ -358,6 +359,17 @@ using JLD2
         @test length(sm.excluded) == 2 && any(e -> e.reason == "failed start", sm.excluded) &&
               any(e -> e.lp == -1.3 && !e.converged && isfinite(e.dist), sm.excluded)
         @test H.distinct_modes(ms) == sm.kept
+        # modes that differ only in the waning rate are distinct (logρ_w is part of the mode comparison)
+        mw(lr) = (; nt = (; μ_λ0 = -3.0, ω_λ0 = 0.5, μ_k2 = -1.0, ω_k2 = 0.5, logVtr = 7.0, logk1 = 0.0, σ = 0.2, logρ_w = lr), lp = 5.0, converged = true)
+        @test length(H.split_modes([mw(-4.0), mw(-2.0)]).kept) == 2 && length(H.split_modes([mw(-4.0), mw(-4.0)]).kept) == 1
+        # gap and k1 are recorded for every excluded start (gap = best lp - lp; NaN for failed starts)
+        eg = only(filter(e -> e.lp == -1.3, sm.excluded))
+        @test eg.gap ≈ 71.3 && eg.k1 ≈ 1.0
+        @test all(e -> hasproperty(e, :gap) && hasproperty(e, :k1), sm.excluded)
+        # converged_gap (v2 production: 30) also excludes converged modes far below the best
+        sg = H.split_modes(ms; converged_gap = 30.0)
+        @test [round(m.lp; digits = 1) for m in sg.kept] == [70.0]
+        @test any(e -> e.lp == 10.0 && e.converged && e.gap ≈ 60.0 && occursin("converged but", e.reason), sg.excluded)
         # a fit whose chains all started from one mode must not report a cross-mode R-hat
         _, pd1 = H.fit_drug(units, doses, pk, cref; drug = "one", nchains = 2, nsamples = 8, nadapt = 6, rng = MersenneTwister(3),
                             map_starts = 2, map_maxiters = 30, window_days = 0)
@@ -386,6 +398,103 @@ using JLD2
             # the same PDX are held out whichever drug is fitted
             @test Set(H.design_units("BKM120", "primary").split["holdout_models"]) ⊆ Set(te)
         end
+    end
+
+    @testset "model v2 (correlated effects, per-PDX Vtr) and waning" begin
+        truth2 = (μ_λ0 = log(0.06), ω_λ0 = 0.4, μ_k2 = log(0.4), ω_k2 = 0.8, corr = 0.5, μ_Vtr = log(1500.0), ω_Vtr = 0.4,
+                  logk1 = log(0.7), σ = 0.15, ρ_w = 0.015)
+        u2, tru2 = H.simulate_units(MersenneTwister(21), 6, doses, pk, cref; truth = truth2, tspan = (21.0, 24.0))
+        @test all(isfinite, tru2.λ1) && all(tru2.λ1 .≈ tru2.λ0 .* tru2.Vtr)
+        # LKJ(2) on a 2x2 correlation is (ρ+1)/2 ~ Beta(2,2): density ∝ (1-ρ²)
+        ρs = [-0.7, -0.2, 0.3, 0.9]
+        dens = [pdf(Beta(2.0, 2.0), (r + 1) / 2) / (1 - r^2) for r in ρs]
+        @test all(≈(dens[1]), dens)
+        # the centred / conditional construction has covariance ρ ω_λ0 ω_k2
+        r = MersenneTwister(5); n = 200_000; ρv = 0.6; ω1 = 0.4; ω2 = 0.8
+        a = ω1 .* randn(r, n); astd = a ./ ω1
+        b = ω2 .* (ρv .* astd .+ sqrt(1 - ρv^2) .* randn(r, n))
+        @test cor(a, b) ≈ ρv atol = 0.01
+        @test std(b) ≈ ω2 rtol = 0.01
+        # a non-centred start converts to the centred/masked parametrisation with identical implied log k2
+        nt = (; μ_λ0 = -3.0, ω_λ0 = 0.5, μ_k2 = -1.0, ω_k2 = 0.7, ρ_u = 0.8, z_λ0 = [0.3, -1.0, 0.5], z_k2 = [0.2, 1.0, -0.4])
+        ρ = 2 * nt.ρ_u - 1
+        bnc = nt.μ_k2 .+ nt.ω_k2 .* (ρ .* nt.z_λ0 .+ sqrt(1 - ρ^2) .* nt.z_k2)
+        ntc = H.apply_k2_mask(H.to_centered(nt), [true, true, true])
+        @test ntc.lk2c ≈ bnc && !haskey(ntc, :z_k2) && !haskey(ntc, :z_λ0) && ntc.llam0 ≈ nt.μ_λ0 .+ nt.ω_λ0 .* nt.z_λ0
+        ntp = H.apply_k2_mask(H.to_centered(nt), [true, false, true])
+        @test ntp.lk2c ≈ bnc[[1, 3]] && ntp.z_k2 == [1.0]
+        # gradients: local per-unit assembly vs finite differences vs global ForwardDiff, per-unit λ1 and waning included
+        for (v2, wn, cen, mask) in ((true, false, true, falses(6)), (true, false, true, [true, false, true, true, false, true]),
+                                    (true, true, true, falses(6)), (true, false, false, falses(6)), (false, true, true, falses(6)))
+            mk(; lg) = begin
+                d = H.prepare_data(u2, doses, pk, cref; solver = tight, model_v2 = v2, waning = wn, centered_lam0 = cen, k2_centered = mask, local_grad = lg, threaded = false)
+                model = H.hier_model(d, H.default_priors())
+                nt0 = H.initial_values(d, H.default_priors(), MersenneTwister(4); jitter = 0.05)
+                vi = DynamicPPL.link(DynamicPPL.initialize_parameters!!(DynamicPPL.VarInfo(MersenneTwister(0), model), nt0, model), model)
+                D = length(vi[:])
+                adt = AutoForwardDiff(chunksize = lg ? min(D, 8) : min(D, 12))
+                (DynamicPPL.LogDensityFunction(model, DynamicPPL.getlogjoint_internal, vi; adtype = adt),
+                 DynamicPPL.LogDensityFunction(model, DynamicPPL.getlogjoint_internal, vi), vi[:])
+            end
+            ldf, ldf0, x = mk(lg = true)
+            lp, g = LogDensityProblems.logdensity_and_gradient(ldf, x)
+            @test isfinite(lp)
+            @test lp ≈ LogDensityProblems.logdensity(ldf0, x) rtol = 1e-8
+            fd = map(eachindex(x)) do i
+                e = zeros(length(x)); e[i] = 1e-5
+                (LogDensityProblems.logdensity(ldf0, x .+ e) - LogDensityProblems.logdensity(ldf0, x .- e)) / 2e-5
+            end
+            @test maximum(abs.(g .- fd) ./ (1 .+ abs.(fd))) < 1e-3
+            ldfg, _, _ = mk(lg = false)
+            lpg, gg = LogDensityProblems.logdensity_and_gradient(ldfg, x)
+            @test lpg ≈ lp rtol = 1e-8
+            @test maximum(abs.(gg .- g) ./ (1 .+ abs.(g))) < 1e-5
+        end
+        # waning exposure: e(t) exp(-ρ t); ρ = 0 reproduces the plain exposure
+        e0 = H.make_exposure(pk, doses, cref)
+        @test H.WaningExposure(e0, 0.0)(7.3) ≈ e0(7.3) && H.WaningExposure(e0, 0.02)(7.3) ≈ e0(7.3) * exp(-0.02 * 7.3)
+        # v2 fit, waning fit: saved fields, pointwise and marginal log-likelihoods, extraction
+        for wn in (false, true)
+            _, pd2 = H.fit_drug(u2, doses, pk, cref; drug = "v2toy", model = :v2, waning = wn, nchains = 2, nsamples = 8, nadapt = 8,
+                                rng = MersenneTwister(31), map_starts = 2, map_maxiters = 40, window_days = 0)
+            dg = pd2.diagnostics
+            @test dg["model"] == "v2" && dg["waning"] == wn && dg["settings"]["model"] == "v2"
+            @test length(dg["corr_lk"]) == 16 && all(-1 .< dg["corr_lk"] .< 1)
+            @test size(dg["lambda1_draws"]) == (16, 6) && all(dg["lambda1_draws"] .> 0)
+            @test length(dg["mu_logVtr"]) == 16 && all(dg["omega_Vtr"] .> 0)
+            @test wn ? (length(dg["waning_rate"]) == 16 && all(dg["waning_rate"] .> 0)) : isempty(dg["waning_rate"])
+            @test pd2.logλ1 ≈ pd2.μ_λ0 .+ dg["mu_logVtr"]                  # pooled field = population-median λ1
+            ll = H.pointwise_loglik(pd2, u2; draws = 1:4)
+            idx2 = H.pointwise_index(u2)
+            @test all(isfinite, ll) && size(ll) == (4, length(idx2.t))
+            # pointwise sums reproduce the unit likelihood at that draw's own λ1_i, k2_i, λ0_i (and ρ)
+            d2 = H.prepare_data(u2, doses, pk, cref; model_v2 = true, waning = wn)
+            s_ = 3
+            for (i, u) in enumerate(d2.units)
+                v = H.unit_loglik(u, log(pd2.λ0[s_, i]), log(pd2.k2[s_, i]), log(dg["lambda1_draws"][s_, i]), pd2.logk1[s_], pd2.σ[s_],
+                                  log(pd2.w0_control_draws[s_, i]), log(pd2.w0_treated_draws[s_, i]), d2; lrho = wn ? log(dg["waning_rate"][s_]) : nothing)
+                @test sum(ll[s_, idx2.group .== i]) ≈ v rtol = 1e-8
+            end
+            mg = H.marginal_unit_loglik(pd2, u2; M = 8, rng = MersenneTwister(2), draws = 1:3, threaded = false)
+            @test size(mg) == (3, 6) && all(isfinite, mg)
+            @test_throws ArgumentError H.marginal_unit_loglik(pd2, u2; M = 4, eps = randn(4, 4), draws = 1:2)
+        end
+        # v2 start / staged layout: the logit link of ρ_u and the log link of ω_Vtr match DynamicPPL's
+        d3 = H.prepare_data(u2, doses, pk, cref; model_v2 = true, waning = true, threaded = false)
+        mm2 = H.map_modes(u2, doses, pk, cref; window_days = 0, nstarts = 2, maxiters = 60, rng = MersenneTwister(3), logger = _ -> nothing, model_v2 = true, waning = true)
+        @test all(m -> haskey(m.nt, :ρ_u) && haskey(m.nt, :μ_Vtr) && haskey(m.nt, :z_Vtr) && haskey(m.nt, :logρ_w) && !haskey(m.nt, :logVtr), mm2.starts)
+        tg = H.stage_target(u2, doses, pk, cref; start = mm2.starts[1].nt, k2_centered = mm2.k2_centered, window_days = 0, threaded = false, model_v2 = true, waning = true)
+        vi3 = DynamicPPL.link(DynamicPPL.initialize_parameters!!(DynamicPPL.VarInfo(MersenneTwister(0), tg.model), mm2.starts[1].nt, tg.model), tg.model)
+        θ3 = tg.θ0 .+ 0.05 .* randn(MersenneTwister(2), length(tg.θ0))
+        @test H.constrain_draws(tg.layout, reshape(θ3, 1, :))[1, :] ≈ DynamicPPL.invlink(DynamicPPL.unflatten(vi3, θ3), tg.model)[:]
+        @test H.unconstrain(tg.layout, mm2.starts[1].nt) ≈ vi3[:]
+        # fingerprint depends on the model version and waning
+        base = (; drug = "binimetinib", design = "primary", window = 42.0, models = ["a"], split = Dict("kind" => "primary"), priors = H.default_priors(),
+                nu = 5.0, baseline_sd = 0.1, lod = 4.0, doses = doses, pk = pk, cref = cref, k2_centered = [true], centered_lam0 = true,
+                latent_w0 = true, reltol = 1e-5, abstol = 1e-5, init_id = "x")
+        f1 = H.target_fingerprint(H.fingerprint_text(; base...))
+        @test f1 != H.target_fingerprint(H.fingerprint_text(; base..., model = "v2"))
+        @test f1 != H.target_fingerprint(H.fingerprint_text(; base..., waning = true))
     end
 
     @testset "diagnostics edge cases" begin

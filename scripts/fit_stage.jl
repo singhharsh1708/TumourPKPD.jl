@@ -24,6 +24,8 @@
 #
 # Optional flags: --seed=1 --units=N (smoke tests: subsample N paired PDX) --mapstarts=5 --mapiters=1000 --target=0.8
 #                 --maxdepth=10 --nu=5 --baseline-sd=0.1 --window=<days> --burnin=25
+#                 init: --model=v1|v2 (default v1; v2 = correlated (log λ0, log k2) + per-PDX transition volume) --waning (pooled efficacy decay)
+#                       --mode-gap=G (default Inf: every converged distinct MAP mode starts chains; G=30 drops converged modes > 30 log-density units below the best)
 #                 warmup: --init-buffer=75 --term-buffer=50 --window-size=25 (Stan adaptation windows)
 # stdout is flushed every second; progress lines every 25 iterations.
 using TumourPKPD, Random, Statistics, Printf, Dates, JLD2, MCMCChains
@@ -66,7 +68,9 @@ function target_fp(init, du, models, pri, pk, doses, cref, mask)
     txt = M.fingerprint_text(; drug = init["drug"], design = init["design"], window = init["window"], models, split = du.split,
                              priors = pri, nu = init["nu"], baseline_sd = init["baseline_sd"], lod = init["lod"], doses, pk, cref,
                              k2_centered = mask, centered_lam0 = init["centered_lam0"], latent_w0 = init["latent_w0"],
-                             reltol = init["reltol"], abstol = init["abstol"], init_id = init["init_id"])
+                             reltol = init["reltol"], abstol = init["abstol"], init_id = init["init_id"],
+                             model = get(init, "model", "v1"), waning = get(init, "waning", false),
+                             mode_gap = get(init, "mode_gap", Inf))
     return M.target_fingerprint(txt)
 end
 
@@ -89,7 +93,8 @@ function load_context(dir, drug, design; start_mode::Union{Nothing,Int} = nothin
     nt = start_mode === nothing ? init["modes"][1].nt : init["modes"][start_mode].nt
     tgt = M.stage_target(du.train, doses, pk, cref; start = nt, lod = init["lod"], priors = pri, latent_w0 = init["latent_w0"],
                          reltol = init["reltol"], abstol = init["abstol"], nu = init["nu"], baseline_sd = init["baseline_sd"],
-                         centered_lam0 = init["centered_lam0"], k2_centered = mask, window_days = 0)
+                         centered_lam0 = init["centered_lam0"], k2_centered = mask, window_days = 0,
+                         model_v2 = get(init, "model", "v1") == "v2", waning = get(init, "waning", false))
     return (; init, du, pk, doses, cref, pri, mask, tgt, models = prepared, fingerprint = init["fingerprint"])
 end
 
@@ -104,32 +109,38 @@ function do_init(drug, design, opts)
     nu = parse(Float64, getopt(opts, "nu", "5")); bsd = parse(Float64, getopt(opts, "baseline-sd", "0.1"))
     nstarts = parse(Int, getopt(opts, "mapstarts", "5")); mapiters = parse(Int, getopt(opts, "mapiters", "1000"))
     window = haskey(opts, "window") ? parse(Float64, opts["window"]) : nothing
+    model = getopt(opts, "model", "v1"); model in ("v1", "v2") || error("--model must be v1 or v2")
+    waning = haskey(opts, "waning") && opts["waning"] != "false"
+    # v2 production default 30 (a converged mode ~90 log-density units below the best also has a data log-likelihood ~72 lower:
+    # negligible posterior mass, and chains started there do not mix back); v1 default Inf keeps every converged mode.
+    mode_gap = parse(Float64, getopt(opts, "mode-gap", model == "v2" ? "30" : "Inf"))      # converged MAP modes further than this below the best are not used as chain starts (recorded as excluded)
     du = M.design_units(drug, design; frac = 0.2, seed = 1, window, subsample = sub)
     prepared, dropped = M.prepare_units(du.train; warn = false)
     stamp("init $drug $design: $(length(prepared)) training PDX (window <= $(du.window) d), holdout $(length(du.split["holdout_models"])), dropped $(length(dropped))")
     pk, doses, cref = pk_and_doses(drug)
     pri = M.default_priors()
+    stamp("model $model" * (waning ? " with waning efficacy" : ""))
     mm = M.map_modes(du.train, doses, pk, cref; window_days = 0, nu, baseline_sd = bsd, nstarts, maxiters = mapiters,
-                     priors = pri, rng = MersenneTwister(seed), logger = stamp)
+                     priors = pri, rng = MersenneTwister(seed), logger = stamp, model_v2 = model == "v2", waning, mode_gap)
     stamp("MAP log-densities of all $(length(mm.all_lps)) starts: " * join(round.(mm.all_lps; digits = 1), ", ") *
           "; $(length(mm.starts)) distinct mode(s): " * join(round.([m.lp for m in mm.starts]; digits = 1), ", "))
     modes_nt = [(; nt = m.nt, lp = m.lp) for m in mm.starts]
     init_id = M.target_fingerprint(string(now()) * "|" * join([string(m.lp) * ":" * join(string.(collect(Iterators.flatten(
         [v isa Real ? [v] : collect(v) for v in values(m.nt)]))), ",") for m in mm.starts], ";"))
-    excluded = [Dict{String,Any}("lp" => e.lp, "converged" => e.converged, "dist" => e.dist, "reason" => e.reason) for e in mm.excluded]
+    excluded = [Dict{String,Any}("lp" => e.lp, "converged" => e.converged, "dist" => e.dist, "gap" => e.gap, "k1" => e.k1, "reason" => e.reason) for e in mm.excluded]
     meta = Dict{String,Any}("drug" => drug, "design" => design, "window" => du.window, "nu" => nu, "baseline_sd" => bsd, "lod" => detection_limit(),
                             "reltol" => 1e-5, "abstol" => 1e-5, "latent_w0" => true, "centered_lam0" => true, "init_id" => init_id)
     fp = M.target_fingerprint(M.fingerprint_text(; drug, design, window = du.window, models = [u.model for u in prepared], split = du.split,
                                                  priors = pri, nu, baseline_sd = bsd, lod = detection_limit(), doses, pk, cref,
                                                  k2_centered = mm.k2_centered, centered_lam0 = true, latent_w0 = true, reltol = 1e-5,
-                                                 abstol = 1e-5, init_id))
+                                                 abstol = 1e-5, init_id, model, waning, mode_gap))
     jldsave(joinpath(out, "init.jld2");
             drug, design, window = du.window, subsample = sub, model_frac = 0.2, split_seed = 1, seed,
             nu, baseline_sd = bsd, lod = detection_limit(), reltol = 1e-5, abstol = 1e-5, latent_w0 = true, centered_lam0 = true,
             priors = priors_dict(pri), train_models = [u.model for u in prepared], dropped = dropped,
             k2_centered = mm.k2_centered, k2_centered_models = [u.model for (u, c) in zip(prepared, mm.k2_centered) if c],
             modes = modes_nt, all_lps = mm.all_lps, excluded_modes = excluded,
-            split = du.split, cutoffs = du.cutoffs, created = string(now()), init_id, fingerprint = fp)
+            split = du.split, cutoffs = du.cutoffs, created = string(now()), init_id, fingerprint = fp, model, waning, mode_gap)
     stamp("wrote $(joinpath(out, "init.jld2")) (k2 centred for $(count(mm.k2_centered)) of $(length(mm.k2_centered)) units)")
 end
 
@@ -258,6 +269,7 @@ function do_merge(drug, design, opts)
                        latent_w0 = init["latent_w0"], nu = init["nu"], baseline_sd = init["baseline_sd"],
                        centered_lam0 = init["centered_lam0"], reltol = init["reltol"], abstol = init["abstol"],
                        window_days = 0, precomputed_chain = chain, precomputed_runtime = wall_core, k2_centered = ctx.mask,
+                       model = Symbol(get(init, "model", "v1")), waning = get(init, "waning", false),
                        split = init["split"], cutoffs = init["cutoffs"], seed = init["seed"], map_lps = init["all_lps"],
                        worker_info = (; staged = true, threads_per_job = first(parts)["threads"],
                                       chain_seeds = [p["seed"] for p in parts], warmup_seeds = [warm[K]["seed"] for K in Ks]))
@@ -276,7 +288,9 @@ function do_merge(drug, design, opts)
 
     # ---- diagnostics: all (K,P) chains, per warmup chain K (parts concatenated), cross-mode
     prm_all, rh_all, es_all = rhat_ess(chain)
-    pop = [:μ_λ0, :ω_λ0, :μ_k2, :ω_k2, :logVtr, :logk1, :σ]
+    pop = get(init, "model", "v1") == "v2" ? [:μ_λ0, :ω_λ0, :μ_k2, :ω_k2, :ρ_u, :μ_Vtr, :ω_Vtr, :logk1, :σ] :
+                                             [:μ_λ0, :ω_λ0, :μ_k2, :ω_k2, :logVtr, :logk1, :σ]
+    get(init, "waning", false) && push!(pop, :logρ_w)
     keep = [Symbol(n) for n in MCMCChains.names(chain, :parameters)]
     byK = Chains[]
     for K in Ks
@@ -300,9 +314,12 @@ function do_merge(drug, design, opts)
     println(md, "Staged fit (`scripts/fit_stage.jl`). No data in this file; parameters and sampler statistics only.\n")
     println(md, "- training PDX: $(length(ctx.models)) (window <= $(init["window"]) d); frozen split seed $(init["split_seed"]), holdout $(length(init["split"]["holdout_models"])) PDX")
     println(md, "- chains: $(length(parts)) = warmup chains K = $(join(Ks, ",")) x parts; $nd draws each ($(nd * length(parts)) draws), burn-in per part $(first(parts)["burnin"]), warmup $(first(values(warm))["nadapt"]) iterations")
-    println(md, "- model: Student-t nu=$(init["nu"]) residuals, latent baselines (sd $(init["baseline_sd"])), LOD $(init["lod"]) mm^3, k2 centred for $(count(ctx.mask)) of $(length(ctx.mask)) units, centred lambda0")
+    println(md, "- model: **$(get(init, "model", "v1"))**$(get(init, "waning", false) ? " + waning efficacy" : "") (v2 = correlated log λ0/log k2 with LKJ(2), per-PDX transition volume); Student-t nu=$(init["nu"]) residuals, latent baselines (sd $(init["baseline_sd"])), LOD $(init["lod"]) mm^3, k2 centred for $(count(ctx.mask)) of $(length(ctx.mask)) units, centred lambda0")
     println(md, "- target fingerprint: `$(ctx.fingerprint)` (init id `$(init["init_id"])`); chains started from $(nstart_modes) distinct recorded mode(s)")
-    println(md, "- excluded MAP starts: " * (isempty(init["excluded_modes"]) ? "none" : join([@sprintf("lp %.1f (%s, max param distance to best %.2f)", e["lp"], e["reason"], e["dist"]) for e in init["excluded_modes"]], "; ")))
+    println(md, "- mode gap limit: " * (isfinite(get(init, "mode_gap", Inf)) ? "$(init["mode_gap"]) log-density units (converged modes further below the best are not used as chain starts)" : "none (every converged distinct mode starts chains)"))
+    println(md, "- excluded MAP starts: " * (isempty(init["excluded_modes"]) ? "none" : join([@sprintf("lp %.1f, gap %.1f, k1 %.3g (%s, max param distance to best %.2f)", e["lp"], get(e, "gap", NaN), get(e, "k1", NaN), e["reason"], e["dist"]) for e in init["excluded_modes"]], "; ")))
+    any(e -> haskey(e, "gap") && isfinite(e["gap"]) && e["converged"], init["excluded_modes"]) &&
+        println(md, "  - justification: an excluded converged mode lies about 90 log-density units below the best mode and its data log-likelihood is about 72 lower, so its posterior mass is negligible; chains started there stay in the poor mode and only inflate R-hat. Recorded here (lp, gap, k1) instead of being silently dropped.")
     println(md, "- MAP: log-densities of the starts $(join(round.(init["all_lps"]; digits = 1), ", ")); $nmodes distinct mode(s) $(join(round.([m.lp for m in init["modes"]]; digits = 1), ", ")); chains K start at mode `mod1(K, $nmodes)`\n")
     println(md, "## Convergence\n")
     println(md, @sprintf("| statistic | value |\n|---|---|\n| max R-hat, all %d (K,P) chains | %.4f |\n| min bulk ESS, all chains | %.0f |\n| max R-hat, per warmup chain K (%d chains) | %s |\n| cross-mode R-hat (chains started from different modes) | %s |\n| divergences | %d |\n| mean acceptance | %.3f |\n| mean tree depth | %.2f |\n| mean n_steps | %.1f |\n| depth-limit hits | %d |",
@@ -340,9 +357,11 @@ function do_merge(drug, design, opts)
         println(md, @sprintf("| %s.%s | %d | %.1f | %d | %.1f |", p["chain"], p["part"], p["seed"], mean(p["stats"][:, 1]), Int(sum(p["stats"][:, 5])), p["sample_time_s"] / 60))
     end
     println(md, "\nCore-time of all stages (sum of job times): $(round(wall_core / 3600; digits = 2)) h.")
-    path = joinpath(out, "$(drug)_$(design).jld2")
+    # v1 keeps the contract names; v2 / waning fits get a suffix so they sit next to the v1 fits (also set by CI as SUFFIX)
+    suffix = (get(init, "model", "v1") == "v2" ? "_v2" : "") * (get(init, "waning", false) ? "_waning" : "")
+    path = joinpath(out, "$(drug)_$(design)$(suffix).jld2")
     M.save_fit(path, pd)
-    write(joinpath(out, "$(drug)_$(design)_diagnostics.md"), String(take!(md)))
+    write(joinpath(out, "$(drug)_$(design)$(suffix)_diagnostics.md"), String(take!(md)))
     stamp(@sprintf("merged: max R-hat %.4f, min ESS %.0f, divergences %d; saved %s and the diagnostics md", dg["max_rhat"], dg["min_ess_bulk"], dg["n_divergences"], path))
     return pd
 end

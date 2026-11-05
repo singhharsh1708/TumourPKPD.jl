@@ -47,7 +47,7 @@ the last observed day of every training curve (`diagnostics["cutoffs"]`).
 ```
 gh workflow run fits.yml \
   -f drugs=binimetinib,BKM120,BYL719 -f designs=primary,late21 \
-  -f nchains=4 -f nadapt=500 -f parts=2 -f draws_per_part=250 -f seglen=250 -f burnin=25
+  -f nchains=4 -f nadapt=500 -f parts=2 -f draws_per_part=250 -f seglen=125 -f burnin=25
 ```
 
 All inputs are optional; the values above are the defaults. Draws per chain = `parts x draws_per_part`.
@@ -60,9 +60,11 @@ All inputs are optional; the values above are the defaults. Draws per chain = `p
 | `nadapt` | warmup iterations per chain |
 | `parts` | sampling parts per chain (1-based part index P), one job each |
 | `draws_per_part` | retained draws per part |
-| `seglen` | warmup segment length. `250` (default) splits each chain's warmup into two jobs of up to `seglen` iterations (needs `nadapt <= 2 x seglen`, only two segments are supported); `0`, or a value `>= nadapt`, runs the whole warmup in one job |
+| `seglen` | warmup segment length. `125` (default) splits each chain's warmup into `ceil(nadapt / seglen)` chained jobs (`warmup`, `warmup2`, `warmup3`, `warmup4`) of up to `seglen` iterations; at most 4 segments, so `nadapt <= 4 x seglen` (checked in `prep`); `0`, or a value `>= nadapt`, runs the whole warmup in one job |
 | `burnin` | iterations discarded at the start of each sampling part (no adaptation), default 25 |
 | `units` | optional: subsample N PDX units (smoke tests only; recorded in `init.jld2`) |
+| `model` | `v1` (default; independent log lambda0 / log k2 effects, pooled transition volume) or `v2` (correlated effects with an LKJ(2) prior on their 2x2 correlation and a per-PDX transition volume). v2 fits are saved as `fits/<drug>_<design>_v2.jld2` (+ `_diagnostics.md`), so they sit next to the v1 fits. `fit_stage.jl init` uses `--mode-gap=30` for v2 (a converged MAP mode more than 30 log-density units below the best does not start chains; each excluded mode is recorded with lp, gap and k1 in the diagnostics) and no gap limit for v1 |
+| `waning` | `false` (default) or `true`: pooled waning efficacy, kill term `k2 exp(-rho t)`; a sensitivity fit, saved with a `_waning` suffix (`..._v2_waning`) |
 
 Smoke test, a few minutes of sampling and the whole plumbing:
 
@@ -82,15 +84,15 @@ dispatch with the same ref, drugs and designs waits for the first instead of run
 |---|---|---|---|
 | `prep` | - | validates inputs, builds the matrices, restores the Julia depot and precompiles, downloads and cleans PDXE | `pdxe-data` |
 | `init` | drug x design | `fit_stage.jl init`: data prep, multi-start MAP, split metadata | `init-<drug>-<design>` |
-| `warmup` | drug x design x chain | `fit_stage.jl warmup`: NUTS adaptation from init. With `seglen`: segment 1 only (`--seglen --seg=1`), writes the resumable state (adaptor, position, RNG; parameters only). Without: the whole warmup, writes `warm_K` | segmented: `warmseg-<drug>-<design>-<K>-1`; otherwise `warm-<drug>-<design>-<K>` |
-| `warmup2` | drug x design x chain | only when segmented: downloads init and its own segment 1, runs `--seg=2`, writes the warm state (position, step size, metric, seed) | `warm-<drug>-<design>-<K>` |
+| `warmup` | drug x design x chain | `fit_stage.jl warmup`: NUTS adaptation from init. With `seglen` and more than one segment: segment 1 only (`--seglen --seg=1`), writes the resumable state (adaptor, position, RNG; parameters only). Otherwise the whole warmup, writes `warm_K` | segmented: `warmseg-<drug>-<design>-<K>-1`; otherwise `warm-<drug>-<design>-<K>` |
+| `warmup2`, `warmup3`, `warmup4` | drug x design x chain | segment S = 2, 3, 4, each skipped when the warmup has fewer than S segments (`nseg = ceil(nadapt / seglen)`): downloads init and its own segment S-1 state, runs `--seg=S`. Segments before the last write the resumable state, the last one (S = nseg) writes the warm state (position, step size, metric, seed) | `warmseg-<drug>-<design>-<K>-S`; the last one `warm-<drug>-<design>-<K>` |
 | `sample` | drug x design x chain x part | `fit_stage.jl sample --draws --burnin`: fixed-setting sampling from the warm state, no adaptation | `chain-<drug>-<design>-<K>-<P>` |
 | `merge` | drug x design | checks that all chains and parts are there, `fit_stage.jl merge`: R-hat/ESS across all parts, `PosteriorDraws`, diagnostics; upload check | `fit-<drug>-<design>` (**clear**: `<drug>_<design>.jld2`, `<drug>_<design>_diagnostics.md`) |
 
 Every job decrypts what it needs with `STAGE_KEY` and fails clearly if the secret is missing.
 
-GitHub cannot make a job depend on one element of a matrix, so `warmup2` starts only after every `warmup` job is done,
-`sample` after every `warmup` and `warmup2` job, and `merge` after every `sample` job. `sample` always takes the artifact
+GitHub cannot make a job depend on one element of a matrix, so `warmupS` starts only after every `warmup(S-1)` job is done,
+`sample` after every warmup job of every segment, and `merge` after every `sample` job. `sample` always takes the artifact
 `warm-<drug>-<design>-<K>`, whichever job produced it. A combination whose upstream job failed fails within a minute on its artifact
 download; the other combinations carry on. The merge job refuses to run on an incomplete set of chains or parts.
 
@@ -109,13 +111,13 @@ late21 fits cost about half. Each job adds 5-10 min of JIT.
 | prep, warm depot cache | - | not yet measured |
 | init (5 starts x 1000 iterations) | about 30-40 min (2 starts x 300 its took 3 min) | primary 32-65 min, late21 24-52 min |
 | warmup, nadapt=500, whole chain, M-series | about 2.0 h (range 1.7-2.6 h); the first ~100 iterations at tree depth 9 cost ~55 min | not run unsegmented on a hosted runner |
-| warmup segmented, seglen=250 | segment 1 about 1.3 h, segment 2 about 0.6 h | segment 1: primary 90-323 min (median 201), late21 34-135; segment 2: primary 58-190, late21 17-100. **Primary segment 1 came within 7 min of the 330-min timeout: use seglen=150 (4 segments need code support) or fewer warmup iterations for primary.** |
+| warmup segmented, seglen=250 (v1; the default is now 125) | segment 1 about 1.3 h, segment 2 about 0.6 h | segment 1: primary 90-323 min (median 201), late21 34-135; segment 2: primary 58-190, late21 17-100. **Primary segment 1 came within 7 min of the 330-min timeout: use `seglen=125` (up to 4 segments are now supported).** |
 | sample, 250 draws + 25 burn-in, per part | 18-39 min | primary 47-155 min (median 104), late21 18-121 (median 44) |
 | merge | minutes | _TBD_ |
 | whole run (default inputs, with queueing) | | _TBD_ |
 
 If a `sample` job approaches 330 minutes, raise `parts` and lower `draws_per_part`. If a warmup segment is too long, lower
-`seglen` (only down to `nadapt / 2`: two segments at most) or lower `nadapt`.
+`seglen` (down to `nadapt / 4`: four segments at most) or lower `nadapt`.
 
 ## Download the fits
 
@@ -158,9 +160,8 @@ DRUG=BKM120; DESIGN=late21; DIR=stage/${DRUG}_${DESIGN}; mkdir -p $DIR fits
 julia --project=. -t 4 scripts/fit_stage.jl init   $DRUG $DESIGN --out=$DIR            # add --units=12 to subsample
 for K in 1 2 3 4; do
   julia --project=. -t 4 scripts/fit_stage.jl warmup $DRUG $DESIGN --chain=$K --dir=$DIR --nadapt=500   # one job ...
-  # ... or two resumable segments (as the workflow does with seglen=250):
-  #   ... warmup $DRUG $DESIGN --chain=$K --dir=$DIR --nadapt=500 --seglen=250 --seg=1
-  #   ... warmup $DRUG $DESIGN --chain=$K --dir=$DIR --nadapt=500 --seglen=250 --seg=2
+  # ... or up to four resumable segments (as the workflow does with seglen=125):
+  #   for S in 1 2 3 4; do ... warmup $DRUG $DESIGN --chain=$K --dir=$DIR --nadapt=500 --seglen=125 --seg=$S; done
 done
 for K in 1 2 3 4; do for P in 1 2; do
   julia --project=. -t 4 scripts/fit_stage.jl sample $DRUG $DESIGN --chain=$K --part=$P --dir=$DIR --draws=250 --burnin=25

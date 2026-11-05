@@ -436,7 +436,7 @@ Sampler diagnostics of a fit for the validation report: what the fit recorded (`
 `min_ess_tail`, `n_divergences`, E-BFMI, tree-depth cap hits, mean acceptance / tree depth / step size /
 leapfrog steps, the cross-mode R-hat, MAP log-densities, chains and draws per chain; `nothing` when the
 fit did not record an item) and a recomputation from the stored draws of the seven hyperparameters
-(`μ_λ0, ω_λ0, μ_k2, ω_k2, logλ1, logk1, σ`) using the saved chain layout (`recomputed`: names, rhat,
+(`μ_λ0, ω_λ0, μ_k2, ω_k2, logλ1, logk1, σ`, plus `corr_lk`, `mu_logVtr`, `omega_Vtr`, `waning_rate` for v2 / waning fits) using the saved chain layout (`recomputed`: names, rhat,
 ess_bulk, ess_tail; `nothing` if the draw count does not match `nchains`). Draws are stored chain after
 chain. Keys read: `nchains`, `draws_per_chain`, `max_rhat`, `min_ess_bulk`, `min_ess_tail`, `n_divergences`,
 `min_ebfmi`/`ebfmi`, `max_tree_depth_hits`, `mean_tree_depth`, `mean_acceptance`, `mean_step_size`,
@@ -454,7 +454,12 @@ function convergence_summary(pd)
     if S % nch == 0 && S ÷ nch >= 4
         L = S ÷ nch
         nm = ["μ_λ0", "ω_λ0", "μ_k2", "ω_k2", "logλ1", "logk1", "σ"]
-        cols = (pd.μ_λ0, pd.ω_λ0, pd.μ_k2, pd.ω_k2, pd.logλ1, pd.logk1, pd.σ)
+        cols = Any[pd.μ_λ0, pd.ω_λ0, pd.μ_k2, pd.ω_k2, pd.logλ1, pd.logk1, pd.σ]
+        # v2 / waning hyperparameters (per draw), when the fit has them
+        for (lab, key) in (("corr(log λ0, log k2)", "corr_lk"), ("μ_logVtr", "mu_logVtr"), ("ω_Vtr", "omega_Vtr"), ("waning rate", "waning_rate"))
+            v = first_meta(key)
+            (v isa AbstractVector && length(v) == S) && (push!(nm, lab); push!(cols, v))
+        end
         arr = Array{Float64}(undef, L, length(nm), nch)
         for c in 1:nch, (j, v) in enumerate(cols)
             arr[:, j, c] = v[(c-1)*L+1:c*L]

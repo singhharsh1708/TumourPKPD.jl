@@ -32,7 +32,7 @@ const PD_FIELDS = [:drug, :models, :doses, :pk, :cref, :μ_λ0, :ω_λ0, :μ_k2,
     :w0_control, :w0_treated, :w0_control_draws, :w0_treated_draws, :diagnostics]
 
 # top-level diagnostics keys. kind: :scalar (number, string, bool), :strings, :bools, :ints, :floats (short vector
-# of sampler summaries), :dictlist (short vector of dicts, checked like :dict), :dict (checked recursively: scalars, strings, short integer/string vectors, nested dicts)
+# of sampler summaries), :drawvec (one number per posterior draw, or empty), :drawmat (ndraw x nmodel posterior draws of a PDX-level parameter), :dictlist (short vector of dicts, checked like :dict), :dict (checked recursively: scalars, strings, short integer/string vectors, nested dicts)
 const DIAG_KEYS = Dict{String,Symbol}(
     "baseline_sd" => :scalar, "chain_start_modes" => :ints, "cross_mode_rhat" => :scalar, "cutoffs" => :cutoffs,
     "draws_per_chain" => :scalar, "dropped_units" => :strings, "fit_window_day" => :scalar, "k2_centered" => :bools,
@@ -44,6 +44,8 @@ const DIAG_KEYS = Dict{String,Symbol}(
     "mode_lps" => :floats, "n_distinct_modes" => :scalar, "n_divergences" => :scalar, "nchains" => :scalar,
     "nu" => :scalar, "rhat_by_warmup_chain" => :scalar, "runtime_s" => :scalar, "seed" => :scalar,
     "fingerprint" => :scalar, "n_start_modes" => :scalar, "excluded_modes" => :dictlist,
+    "model" => :scalar, "waning" => :scalar, "waning_rate" => :drawvec, "corr_lk" => :drawvec, "mu_logVtr" => :drawvec,
+    "omega_Vtr" => :drawvec, "lambda1_draws" => :drawmat,
     "settings" => :dict, "split" => :dict, "stage" => :dict, "train_models" => :strings, "tumour_types" => :dict)
 const MAX_SHORT = 64          # longest numeric vector allowed in :floats / dict values
 
@@ -127,6 +129,12 @@ function check_fit_structure(f, bad)
             v isa AbstractVector{<:Integer} || push!(bad, "diagnostics[$k] should be a vector of integers")
         elseif kind == :floats
             (v isa AbstractVector{<:Real} && length(v) <= MAX_SHORT) || push!(bad, "diagnostics[$k] should be a short numeric vector")
+        elseif kind == :drawvec
+            (v isa AbstractVector{<:Real} && (isempty(v) || length(v) == length(pd.σ))) ||
+                push!(bad, "diagnostics[$k] should be empty or have one value per posterior draw ($(length(pd.σ)))")
+        elseif kind == :drawmat
+            (v isa AbstractMatrix{<:Real} && size(v) == (length(pd.σ), length(pd.models))) ||
+                push!(bad, "diagnostics[$k] should be an ndraw x nmodel matrix ($(length(pd.σ)) x $(length(pd.models)))")
         elseif kind == :dict
             v isa AbstractDict || push!(bad, "diagnostics[$k] should be a Dict")
         elseif kind == :dictlist

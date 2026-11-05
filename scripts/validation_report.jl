@@ -3,9 +3,12 @@
 #
 #   julia --project=TumourPKPD.jl -t 3 scripts/validation_report.jl <drug> [--marginal-loo] [--no-loo] [--ndraws=200]
 #                                      [--resp-draws=1000] [--out=DIR]
-#   julia --project=TumourPKPD.jl -t 3 scripts/validation_report.jl <drug> --fits-dir=DIR --tag=v2 [--out=DIR]
-#        model-comparison mode: verifies and scores the fits in DIR (v2) and in fits/ (v1), writes
-#        docs/validation_<drug>_<tag>.md and docs/compare_<drug>.md (v1 vs v2 key metrics)
+#   julia --project=TumourPKPD.jl -t 3 scripts/validation_report.jl <drug> --fits-dir=DIR --tag=v2 [--suffix=_v2]
+#                                      [--suffix-v1=] [--fits-dir-v1=fits] [--out=DIR]
+#        model-comparison mode: verifies and scores the fits DIR/<drug>_primary<suffix>.jld2 and DIR/<drug>_late21<suffix>.jld2
+#        (v2; e.g. --suffix=_v2 or --suffix=_v2_waning) against the v1 fits (fits/<drug>_primary.jld2 ...), writes
+#        docs/validation_<drug>_<tag>.md and docs/compare_<drug>.md (v1 vs v2 key metrics). Also works without --fits-dir for a
+#        single report: `<drug> --suffix=_v2 --tag=v2`.
 #   julia --project=TumourPKPD.jl -t 2 scripts/validation_report.jl --selftest
 #
 # Reads (under fits/, each a `save_fit` JLD2 holding a PosteriorDraws):
@@ -836,6 +839,9 @@ end
 
 load_if(path) = isfile(path) ? M.load_fit(path) : nothing
 
+"Path of a merged fit: `<dir>/<drug>_<design><suffix>.jld2`, e.g. suffix `_v2` or `_v2_waning`."
+fit_path(dir, drug, design, suffix = "") = joinpath(dir, "$(drug)_$(design)$(suffix).jld2")
+
 primary_select(c) = (c.t .> 0) .& (c.t .<= PRIMARY_WINDOW)
 late_select(c) = (c.t .> LATE_WINDOW) .& (c.t .<= PRIMARY_WINDOW)
 const EDGES_PRIMARY = [0.0, 7, 14, 21, 28, 35, 42]
@@ -976,7 +982,8 @@ the split declared in the fits (comparison mode passes one shared split, and eve
 `write=false`. Returns the evaluation and the verification outcome. `loo=false` skips PSIS-LOO.
 """
 function run_real(drug; ndraws = 200, nresp = 1000, seed = 1, marginal_loo = false, loo = true, write = true, tag = "",
-                  fitdir = joinpath(ROOT, "fits"), outdir = joinpath(ROOT, "docs"), split = nothing, counts = nothing, fits = nothing)
+                  fitdir = joinpath(ROOT, "fits"), outdir = joinpath(ROOT, "docs"), split = nothing, counts = nothing, fits = nothing,
+                  suffix = "")
     isdefined(M, :drug_dataset) || error("data.jl (drug_dataset, load_metrics) is not included in TumourPKPD")
     units = M.drug_dataset(drug)
     drug_models = sort([u.model for u in units])
@@ -991,7 +998,8 @@ function run_real(drug; ndraws = 200, nresp = 1000, seed = 1, marginal_loo = fal
         nothing
     end
     notes = String[]; unverified = String[]
-    pd_primary, pd_late = fits === nothing ? (load_if(joinpath(fitdir, "$(drug)_primary.jld2")), load_if(joinpath(fitdir, "$(drug)_late21.jld2"))) : fits
+    pd_primary, pd_late = fits === nothing ?
+        (load_if(fit_path(fitdir, drug, "primary", suffix)), load_if(fit_path(fitdir, drug, "late21", suffix))) : fits
     # split settings: the shared split if given, else the fit's declared frac/seed; the frozen split is recomputed and the
     # fits are verified against it
     sp(pd) = pd === nothing ? nothing : meta(pd, "split")
@@ -1000,9 +1008,9 @@ function run_real(drug; ndraws = 200, nresp = 1000, seed = 1, marginal_loo = fal
     split_seed = split === nothing ? Int(getsp("seed", 1)) : Int(split.seed)
     train_all, test_all, _ = M.frozen_pdx_split(; frac = model_frac, seed = split_seed)
     train_ids, test_ids = expected_split(drug_models; frac = model_frac, seed = split_seed, test_all)
-    pd_primary === nothing && push!(notes, "No $(fitdir)/$(drug)_primary.jld2: held-out PDX prediction, response metrics and LOO skipped.")
+    pd_primary === nothing && push!(notes, "No $(fitdir)/$(drug)_primary$(suffix).jld2: held-out PDX prediction, response metrics and LOO skipped.")
     pd_primary === nothing || append!(unverified, verify_primary_fit(pd_primary, drug, train_ids, test_ids; model_frac, seed = split_seed))
-    pd_late === nothing && push!(notes, "No $(fitdir)/$(drug)_late21.jld2: late-21 forecast skipped.")
+    pd_late === nothing && push!(notes, "No $(fitdir)/$(drug)_late21$(suffix).jld2: late-21 forecast skipped.")
     pd_late === nothing || append!(unverified, verify_late21_fit(pd_late, drug, units, train_ids, test_ids; model_frac, seed = split_seed))
     Sp = pd_primary === nothing ? 0 : length(pd_primary.σ); Sl = pd_late === nothing ? 0 : length(pd_late.σ)
     counts === nothing && (counts = (primary = min(ndraws, Sp), late = min(ndraws, Sl), resp = min(nresp, Sp)))
@@ -1021,7 +1029,9 @@ function run_real(drug; ndraws = 200, nresp = 1000, seed = 1, marginal_loo = fal
     if write
         name = isempty(tag) ? drug : "$(drug)_$(tag)"
         figs, local_figs = make_figures(name, outdir, ev.recs_new, ev.cm_new, ev.rm, ev.bins_new)
-        settings = "Fits: `$(fitdir)`. Frozen split frac $(model_frac), seed $(split_seed): $(length(test_ids)) held-out of $(length(drug_models)) paired PDX for this drug. Predictive draws used (of $(Sp) / $(Sl) stored in the primary / late21 fit): $(counts.primary) for the held-out curve check, $(counts.late) for the late21 forecast, $(counts.resp) for the response section."
+        mdl = pd_primary !== nothing ? pd_primary : pd_late
+        modelinfo = mdl === nothing ? "" : " Model: $(meta(mdl, "model", "v1"))$(Bool(meta(mdl, "waning", false)) ? " with waning efficacy" : "")."
+        settings = "Fits: `$(fitdir)` (files `*$(suffix).jld2`).$(modelinfo) Frozen split frac $(model_frac), seed $(split_seed): $(length(test_ids)) held-out of $(length(drug_models)) paired PDX for this drug. Predictive draws used (of $(Sp) / $(Sl) stored in the primary / late21 fit): $(counts.primary) for the held-out curve check, $(counts.late) for the late21 forecast, $(counts.resp) for the response section."
         path = write_report(drug, outdir; primary = ev.cm_new, late = ev.cm_late, rm = ev.rm, bins_primary = ev.bins_new, bins_late = ev.bins_late,
                             resid_primary = ev.resid_new, resid_late = ev.resid_late, tag,
                             loo_c, loo_m, pd_primary, pd_late, figs, notes, settings, unverified, ids = [u.model for u in units])
@@ -1066,14 +1076,16 @@ passed to both evaluations, where both fit sets are verified against it. The dra
 and of every stored length, the same for both evaluations; the plan and the counts are reported in `compare_<drug>.md`.
 """
 function run_compare(drug; tag, fitdir2, fitdir1 = joinpath(ROOT, "fits"), outdir = joinpath(ROOT, "docs"), loo = true,
-                     ndraws = 200, nresp = 1000, kwargs...)
-    fits1 = (load_if(joinpath(fitdir1, "$(drug)_primary.jld2")), load_if(joinpath(fitdir1, "$(drug)_late21.jld2")))
-    fits2 = (load_if(joinpath(fitdir2, "$(drug)_primary.jld2")), load_if(joinpath(fitdir2, "$(drug)_late21.jld2")))
+                     ndraws = 200, nresp = 1000, suffix = "", suffix1 = "", kwargs...)
+    fits1 = (load_if(fit_path(fitdir1, drug, "primary", suffix1)), load_if(fit_path(fitdir1, drug, "late21", suffix1)))
+    fits2 = (load_if(fit_path(fitdir2, drug, "primary", suffix)), load_if(fit_path(fitdir2, drug, "late21", suffix)))
+    (fits1[1] === nothing && fits1[2] === nothing) && error("no v1 fits found in $(fitdir1) (suffix \"$(suffix1)\")")
+    (fits2[1] === nothing && fits2[2] === nothing) && error("no $(tag) fits found in $(fitdir2) (suffix \"$(suffix)\")")
     split, declared = shared_split([("v1 primary", fits1[1]), ("v1 late21", fits1[2]), ("$(tag) primary", fits2[1]), ("$(tag) late21", fits2[2])])
     counts = shared_counts(fits1, fits2; ndraws, nresp)
     common = (; counts, split, outdir, ndraws, nresp, kwargs...)
-    r2 = run_real(drug; fitdir = fitdir2, tag, loo, write = true, fits = fits2, common...)
-    r1 = run_real(drug; fitdir = fitdir1, tag = "", loo = false, write = false, fits = fits1, common...)
+    r2 = run_real(drug; fitdir = fitdir2, tag, loo, write = true, fits = fits2, suffix, common...)
+    r1 = run_real(drug; fitdir = fitdir1, tag = "", loo = false, write = false, fits = fits1, suffix = suffix1, common...)
     km1 = key_metrics(r1.ev, r1.pd_primary, r1.pd_late); km2 = key_metrics(r2.ev, r2.pd_primary, r2.pd_late)
     plan = (model_frac = split.model_frac, seed = split.seed, n_holdout = r2.n_holdout, declared = declared, counts,
             S1 = r1.stored, S2 = r2.stored)
@@ -1153,6 +1165,23 @@ function run_selftest(; outdir = mktempdir())
     @assert occursin("No demonstrated", auroc_statement(0.6, (0.4, 0.8), 3, 20)) && occursin("Only one held-out responder", auroc_statement(0.6, (0.4, 0.8), 1, 20))
     @assert occursin("excludes 0.5", auroc_statement(0.8, (0.6, 0.9), 8, 20)) && occursin("undefined", auroc_statement(NaN, (NaN, NaN), 0, 20))
     @assert !isempty(ev.resid_late) && all(r -> r.n_pdx >= M.PUBLIC_MIN_PDX, ev.resid_late) && all(b -> 0 <= b.tail_below5 <= 1, bins_new)
+    # a v2 (+ waning) fit set under the `_v2_waning` suffix: file naming, verification and the whole evaluation path
+    N = length(tr_idx)
+    v2extra = Dict("model" => "v2", "corr_lk" => zeros(S), "mu_logVtr" => fill(truth.logλ1 - truth.μ_λ0, S), "omega_Vtr" => fill(0.3, S),
+                   "lambda1_draws" => fill(exp(truth.logλ1), S, N), "waning" => true, "waning_rate" => fill(1e-4, S))
+    v2dir = mktempdir()
+    pd_p2 = mk(tr_idx, PRIMARY_WINDOW; extra = merge(v2extra, Dict("split" => split_meta, "train_models" => train_ids)))
+    pd_l2 = mk(tr_idx, LATE_WINDOW; extra = merge(v2extra, Dict("split" => split_meta, "cutoffs" => cutoffs, "train_models" => train_ids)))
+    M.save_fit(fit_path(v2dir, drug, "primary", "_v2_waning"), pd_p2); M.save_fit(fit_path(v2dir, drug, "late21", "_v2_waning"), pd_l2)
+    @assert basename(fit_path(v2dir, drug, "primary", "_v2_waning")) == "selftest_primary_v2_waning.jld2"
+    l2 = (load_if(fit_path(v2dir, drug, "primary", "_v2_waning")), load_if(fit_path(v2dir, drug, "late21", "_v2_waning")))
+    @assert l2[1] !== nothing && l2[2] !== nothing && meta(l2[1], "model") == "v2" && Bool(meta(l2[1], "waning"))
+    unv2 = vcat(verify_primary_fit(l2[1], drug, train_ids, test_ids; model_frac, seed), verify_late21_fit(l2[2], drug, units, train_ids, test_ids; model_frac, seed))
+    @assert shared_split([("v1", pd_primary), ("v2", l2[1])]) == ((model_frac = model_frac, seed = seed), true)
+    ev2 = evaluate_fits(units, l2[1], l2[2], train_ids, test_ids; counts, seed)
+    @assert 0.75 < ev2.cm_late.coverage_pooled <= 1 && ev2.cm_new.n_pdx >= M.PUBLIC_MIN_PDX && ev2.rm.n_pdx >= M.PUBLIC_MIN_PDX "v2 evaluation"
+    println("v2+waning oracle set (suffix _v2_waning): late21 coverage ", f3(ev2.cm_late.coverage_pooled), ", held-out coverage ", f3(ev2.cm_new.coverage_pooled),
+            "; convergence rows: ", length(M.convergence_summary(l2[1]).recomputed.names))
     # compare mode: v1 vs v2 table passes the public guard and carries both columns
     km = key_metrics(ev, pd_primary, pd_late)
     plan = (model_frac = model_frac, seed = seed, n_holdout = length(test_ids), declared = true, counts,
@@ -1226,10 +1255,11 @@ if abspath(PROGRAM_FILE) == @__FILE__
                   outdir = abspath(get(kw, "out", joinpath(ROOT, "docs"))))
         if haskey(kw, "fits-dir")
             tag = get(kw, "tag", "v2")
-            r = run_compare(pos[1]; tag, fitdir2 = abspath(kw["fits-dir"]), common...)
+            r = run_compare(pos[1]; tag, fitdir2 = abspath(kw["fits-dir"]), suffix = get(kw, "suffix", ""),
+                            suffix1 = get(kw, "suffix-v1", ""), fitdir1 = abspath(get(kw, "fits-dir-v1", joinpath(ROOT, "fits"))), common...)
             println("report: ", r.v2_report, "\ncomparison: ", r.compare)
         else
-            r = run_real(pos[1]; tag = get(kw, "tag", ""), common...)
+            r = run_real(pos[1]; tag = get(kw, "tag", ""), suffix = get(kw, "suffix", ""), common...)
             println("report: ", r.path)
         end
     end
