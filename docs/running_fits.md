@@ -105,12 +105,12 @@ late21 fits cost about half. Each job adds 5-10 min of JIT.
 
 | stage | projected (primary, N~160) | measured on a runner |
 |---|---|---|
-| prep, cold depot cache | - | _TBD_ |
-| prep, warm depot cache | - | _TBD_ |
-| init (5 starts x 1000 iterations) | about 30-40 min (2 starts x 300 its took 3 min) | _TBD_ |
-| warmup, nadapt=500, whole chain, M-series | about 2.0 h (range 1.7-2.6 h); the first ~100 iterations at tree depth 9 cost ~55 min | _TBD_ |
-| warmup segmented, seglen=250 | segment 1 about 1.3 h, segment 2 about 0.6 h | _TBD_ |
-| sample, 250 draws + 25 burn-in, per part | 18-39 min | _TBD_ |
+| prep, cold depot cache | - | 15 min (run 41873171934) |
+| prep, warm depot cache | - | not yet measured |
+| init (5 starts x 1000 iterations) | about 30-40 min (2 starts x 300 its took 3 min) | primary 32-65 min, late21 24-52 min |
+| warmup, nadapt=500, whole chain, M-series | about 2.0 h (range 1.7-2.6 h); the first ~100 iterations at tree depth 9 cost ~55 min | not run unsegmented on a hosted runner |
+| warmup segmented, seglen=250 | segment 1 about 1.3 h, segment 2 about 0.6 h | segment 1: primary 90-323 min (median 201), late21 34-135; segment 2: primary 58-190, late21 17-100. **Primary segment 1 came within 7 min of the 330-min timeout: use seglen=150 (4 segments need code support) or fewer warmup iterations for primary.** |
+| sample, 250 draws + 25 burn-in, per part | 18-39 min | primary 47-155 min (median 104), late21 18-121 (median 44) |
 | merge | minutes | _TBD_ |
 | whole run (default inputs, with queueing) | | _TBD_ |
 
