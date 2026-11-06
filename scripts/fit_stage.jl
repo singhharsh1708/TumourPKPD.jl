@@ -2,8 +2,8 @@
 #
 #   julia --project=. -t 4 scripts/fit_stage.jl init   <drug> <design> --out=DIR
 #   julia --project=. -t 4 scripts/fit_stage.jl warmup <drug> <design> --chain=K --dir=DIR [--nadapt=500] [--seglen=L --seg=S]
-#   julia --project=. -t 4 scripts/fit_stage.jl sample <drug> <design> --chain=K --part=P --dir=DIR [--draws=250] [--burnin=25]
-#   julia --project=. -t 4 scripts/fit_stage.jl merge  <drug> <design> --dir=DIR --out=fits/
+#   julia --project=. -t 4 scripts/fit_stage.jl sample <drug> <design> --chain=K --part=P --dir=DIR [--draws=250] [--burnin=25] [--expect-model=v1|v2 --expect-waning=true|false]
+#   julia --project=. -t 4 scripts/fit_stage.jl merge  <drug> <design> --dir=DIR --out=fits/ [--truncate] [--expect-model=v1|v2 --expect-waning=true|false]
 #
 # <design> is `primary` (frozen stratified 80% of PDX, days <= 42) or `late21` (same PDX, days <= 21).
 #
@@ -50,6 +50,17 @@ function parse_cli(args)
 end
 getopt(opts, k, d) = get(opts, k, d)
 need(opts, k) = haskey(opts, k) ? opts[k] : error("missing --$k")
+
+# Resume runs (workflow input warm_from_run) take init/warm artifacts from an earlier run: the model and waning inputs of this run
+# must be those the earlier run used, or the merged file would get the wrong suffix. Checked early, before any sampling.
+function check_expected(opts, init)
+    if haskey(opts, "expect-model") && opts["expect-model"] != get(init, "model", "v1")
+        error("init.jld2 is for model $(get(init, "model", "v1")), but this run asked for $(opts["expect-model"]); set the model input to match the run being resumed")
+    end
+    if haskey(opts, "expect-waning") && (opts["expect-waning"] == "true") != get(init, "waning", false)
+        error("init.jld2 has waning=$(get(init, "waning", false)), but this run asked for waning=$(opts["expect-waning"]); set the waning input to match the run being resumed")
+    end
+end
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Shared context
@@ -203,6 +214,7 @@ function do_sample(drug, design, opts)
     maxdepth = parse(Int, getopt(opts, "maxdepth", "10"))
     w = JLD2.load(joinpath(dir, "warm_$(K).jld2"))
     ctx = load_context(dir, drug, design; start_mode = w["mode"])
+    check_expected(opts, ctx.init)
     M.verify_fingerprint(ctx.fingerprint, get(w, "fingerprint", nothing); what = "warm_$(K).jld2")
     collect(String.(ctx.tgt.layout.names)) == w["names"] || error("parameter layout differs from the warmup artifact")
     ctx.mask == w["k2_centered"] && ctx.models == w["models"] || error("k2 mask / model ids differ from the warmup artifact")
@@ -238,6 +250,7 @@ function do_merge(drug, design, opts)
     dir = need(opts, "dir"); out = getopt(opts, "out", "fits"); mkpath(out)
     ctx = load_context(dir, drug, design)
     init = ctx.init
+    check_expected(opts, init)
     files = sort(filter(f -> occursin(r"^chain_\d+_\d+\.jld2$", f), readdir(dir)))
     isempty(files) && error("no chain_K_P.jld2 files in $dir")
     parts = [JLD2.load(joinpath(dir, f)) for f in files]
@@ -249,7 +262,13 @@ function do_merge(drug, design, opts)
         ctx.mask == p["k2_centered"] && ctx.models == p["models"] || error("k2 mask / model ids differ in chain $(p["chain"]) part $(p["part"])")
         p["draws"] isa AbstractMatrix || error("bad draws")
     end
+    # parts from different runs (workflow merge_with_run) must be different draws: a repeated seed from the same warm state is a duplicate
+    seeds = [p["seed"] for p in parts]
+    length(unique(seeds)) == length(seeds) || error("duplicate sampling seeds among the chain parts (a part was sampled twice from the same warm state); use a different seed_offset")
     nd = minimum(size(p["draws"], 1) for p in parts)
+    if any(p -> size(p["draws"], 1) != nd, parts) && !haskey(opts, "truncate")
+        error("chain parts have different numbers of draws ($(join(sort(unique(size(p["draws"], 1) for p in parts)), ", "))); merging would discard draws. Use the same draws_per_part as the run being extended, or pass --truncate to cut every part to $nd")
+    end
     chains = [M.stage_chain(ctx.tgt.layout, p["draws"][1:nd, :], p["stats"][1:nd, :]) for p in parts]
     chain = chainscat(chains...)
     labels = ["$(p["chain"]).$(p["part"])" for p in parts]
@@ -298,6 +317,10 @@ function do_merge(drug, design, opts)
         cat = vcat([Array(c[:, keep, 1]) for c in cs]...)
         push!(byK, Chains(reshape(cat, size(cat, 1), size(cat, 2), 1), keep))
     end
+    # chains K can have different numbers of parts (resume with merge_with_run after lost sample jobs): cut the per-K chains
+    # used for the between-warmup-chain R-hat to the shortest, as chainscat needs equal lengths
+    nK = minimum(size(c, 1) for c in byK)
+    byK = [Chains(Array(c[1:nK, keep, 1]) |> a -> reshape(a, size(a, 1), size(a, 2), 1), keep) for c in byK]
     chainK = length(byK) > 1 ? chainscat(byK...) : nothing
     rhK = chainK === nothing ? nothing : rhat_ess(chainK)
     finite(x) = filter(isfinite, x)

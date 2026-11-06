@@ -65,6 +65,9 @@ All inputs are optional; the values above are the defaults. Draws per chain = `p
 | `units` | optional: subsample N PDX units (smoke tests only; recorded in `init.jld2`) |
 | `model` | `v1` (default; independent log lambda0 / log k2 effects, pooled transition volume) or `v2` (correlated effects with an LKJ(2) prior on their 2x2 correlation and a per-PDX transition volume). v2 fits are saved as `fits/<drug>_<design>_v2.jld2` (+ `_diagnostics.md`), so they sit next to the v1 fits. `fit_stage.jl init` uses `--mode-gap=30` for v2 (a converged MAP mode more than 30 log-density units below the best does not start chains; each excluded mode is recorded with lp, gap and k1 in the diagnostics) and no gap limit for v1 |
 | `waning` | `false` (default) or `true`: pooled waning efficacy, kill term `k2 exp(-rho t)`; a sensitivity fit, saved with a `_waning` suffix (`..._v2_waning`) |
+| `warm_from_run` | resume mode: id of an earlier run (digits only). See [Sampling more draws from an earlier run](#sampling-more-draws-from-an-earlier-run) |
+| `seed_offset` | default `0`. The sampling parts of this run are numbered `seed_offset + 1 .. seed_offset + parts`, so their seeds and file names differ from the earlier run's |
+| `merge_with_run` | `false` (default) or `true` (resume mode only): also merge the chain parts of `warm_from_run` |
 
 Smoke test, a few minutes of sampling and the whole plumbing:
 
@@ -148,6 +151,46 @@ gh run rerun <run-id> --failed
 
 re-runs the failed jobs and the jobs that depend on them, reusing the artifacts of the jobs that succeeded. This works
 while the artifacts exist: 2 days for `pdxe-data`, 3 days for stage state (including `warmseg-*`). After that, start a fresh dispatch.
+
+## Sampling more draws from an earlier run
+
+When the sampling jobs of a run were too slow (cap hit) or the merged fit needs more draws, sample again from the same warm
+states without repeating init and warmup:
+
+```
+gh workflow run fits.yml -f designs=primary -f model=v2 -f warm_from_run=42021010753 \
+  -f parts=4 -f draws_per_part=100 -f seed_offset=100
+```
+
+With `warm_from_run` set:
+
+- `prep` still runs (it rebuilds the cleaned data); `init` and every `warmup*` job are skipped.
+- `sample` downloads `init-<drug>-<design>` and `warm-<drug>-<design>-<K>` from that run (`actions/download-artifact` with `run-id`
+  and `github-token`; the workflow has `actions: read`), then samples with this run's `parts`, `draws_per_part` and `burnin`.
+  The target fingerprint is checked as usual, so the data, split, priors, and code must give the same target as the earlier run's init.
+- `seed_offset` numbers the new parts `seed_offset + 1 .. seed_offset + parts` (here 101-104). The sampling seed is a function of
+  the init seed, K and the part number, so a new part number is a new seed. Use an offset of at least the earlier run's `parts`, or
+  larger to be safe.
+- `model` and `waning` must be the ones of the earlier run (they decide the output suffix); `sample` and `merge` check them against
+  `init.jld2` and stop with a message if they differ. `drugs`, `designs` and `nchains` select what to resume: `nchains` may be lower
+  than in the earlier run (chains 1..nchains), not higher.
+- By default `merge` uses only the chain parts of this run: the fit is made from the new draws alone and is saved under the usual
+  name (`<drug>_<design><suffix>`, artifact `fit-<drug>-<design><suffix>` of the new run). The earlier run's `chain-*` artifacts are not downloaded.
+- With `merge_with_run=true`, `merge` also downloads the earlier run's `chain-*` artifacts (chains 1..nchains only) and merges
+  them with the new parts. This needs `seed_offset > 0` and a part number that does not already exist in the earlier run
+  (a repeated name stops the merge); `merge` also stops on a repeated sampling seed. All parts must have the same number of
+  draws, so give `draws_per_part` the value of the earlier run (`--truncate` on `fit_stage.jl merge` cuts every part to the shortest
+  one, but the workflow does not pass it). Parts of the earlier run whose job failed or timed out do not exist and are simply absent;
+  a merge needs at least one part for every chain.
+
+Example, extending a late21 run of 2 parts x 250 draws to 4 parts per chain:
+
+```
+gh workflow run fits.yml -f designs=late21 -f model=v2 -f warm_from_run=<run-id> \
+  -f parts=2 -f draws_per_part=250 -f seed_offset=2 -f merge_with_run=true
+```
+
+Artifacts live 3 days (init, warm, chain-*), so resume within that window. The earlier run's own `fit-*` artifact is not touched.
 
 ## Run the same stages locally
 
