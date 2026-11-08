@@ -837,6 +837,12 @@ end
 # Drivers
 # ---------------------------------------------------------------------------------------
 
+"Repo-relative form of a path for public outputs (never an absolute local path: outside the repo only the base name)."
+function public_path(p)
+    a = abspath(p); r = relpath(a, ROOT)
+    return startswith(r, "..") ? basename(a) : r
+end
+
 load_if(path) = isfile(path) ? M.load_fit(path) : nothing
 
 "Path of a merged fit: `<dir>/<drug>_<design><suffix>.jld2`, e.g. suffix `_v2` or `_v2_waning`."
@@ -944,7 +950,7 @@ function write_compare(drug, outdir, km1, km2; tag1, tag2, dir1, dir2, unv1, unv
     shown = [m for m in km1 if haskey(d2, m.name)]
     io = IOBuffer()
     println(io, "# Model comparison: $(drug), $(tag1) vs $(tag2)\n")
-    println(io, "Generated $(Dates.format(now(), "yyyy-mm-dd HH:MM")). $(tag1): `$(dir1)`; $(tag2): `$(dir2)`. Both fit sets passed the frozen-split, window, ",
+    println(io, "Generated $(Dates.format(now(), "yyyy-mm-dd HH:MM")). $(tag1): `$(public_path(dir1))`; $(tag2): `$(public_path(dir2))`. Both fit sets passed the frozen-split, window, ",
             "cutoff and held-out-leakage checks against one shared split (the script errors otherwise) and are scored by the same code. ",
             "Aggregated metrics only: each pools at least $(PUBMIN) contributing PDX models, and metrics with fewer are left out.\n")
     if plan !== nothing
@@ -1008,9 +1014,9 @@ function run_real(drug; ndraws = 200, nresp = 1000, seed = 1, marginal_loo = fal
     split_seed = split === nothing ? Int(getsp("seed", 1)) : Int(split.seed)
     train_all, test_all, _ = M.frozen_pdx_split(; frac = model_frac, seed = split_seed)
     train_ids, test_ids = expected_split(drug_models; frac = model_frac, seed = split_seed, test_all)
-    pd_primary === nothing && push!(notes, "No $(fitdir)/$(drug)_primary$(suffix).jld2: held-out PDX prediction, response metrics and LOO skipped.")
+    pd_primary === nothing && push!(notes, "No $(public_path(fitdir))/$(drug)_primary$(suffix).jld2: held-out PDX prediction, response metrics and LOO skipped.")
     pd_primary === nothing || append!(unverified, verify_primary_fit(pd_primary, drug, train_ids, test_ids; model_frac, seed = split_seed))
-    pd_late === nothing && push!(notes, "No $(fitdir)/$(drug)_late21$(suffix).jld2: late-21 forecast skipped.")
+    pd_late === nothing && push!(notes, "No $(public_path(fitdir))/$(drug)_late21$(suffix).jld2: late-21 forecast skipped.")
     pd_late === nothing || append!(unverified, verify_late21_fit(pd_late, drug, units, train_ids, test_ids; model_frac, seed = split_seed))
     Sp = pd_primary === nothing ? 0 : length(pd_primary.σ); Sl = pd_late === nothing ? 0 : length(pd_late.σ)
     counts === nothing && (counts = (primary = min(ndraws, Sp), late = min(ndraws, Sl), resp = min(nresp, Sp)))
@@ -1031,7 +1037,7 @@ function run_real(drug; ndraws = 200, nresp = 1000, seed = 1, marginal_loo = fal
         figs, local_figs = make_figures(name, outdir, ev.recs_new, ev.cm_new, ev.rm, ev.bins_new)
         mdl = pd_primary !== nothing ? pd_primary : pd_late
         modelinfo = mdl === nothing ? "" : " Model: $(meta(mdl, "model", "v1"))$(Bool(meta(mdl, "waning", false)) ? " with waning efficacy" : "")."
-        settings = "Fits: `$(fitdir)` (files `*$(suffix).jld2`).$(modelinfo) Frozen split frac $(model_frac), seed $(split_seed): $(length(test_ids)) held-out of $(length(drug_models)) paired PDX for this drug. Predictive draws used (of $(Sp) / $(Sl) stored in the primary / late21 fit): $(counts.primary) for the held-out curve check, $(counts.late) for the late21 forecast, $(counts.resp) for the response section."
+        settings = "Fits: `$(public_path(fitdir))` (files `*$(suffix).jld2`).$(modelinfo) Frozen split frac $(model_frac), seed $(split_seed): $(length(test_ids)) held-out of $(length(drug_models)) paired PDX for this drug. Predictive draws used (of $(Sp) / $(Sl) stored in the primary / late21 fit): $(counts.primary) for the held-out curve check, $(counts.late) for the late21 forecast, $(counts.resp) for the response section."
         path = write_report(drug, outdir; primary = ev.cm_new, late = ev.cm_late, rm = ev.rm, bins_primary = ev.bins_new, bins_late = ev.bins_late,
                             resid_primary = ev.resid_new, resid_late = ev.resid_late, tag,
                             loo_c, loo_m, pd_primary, pd_late, figs, notes, settings, unverified, ids = [u.model for u in units])
@@ -1158,6 +1164,8 @@ function run_selftest(; outdir = mktempdir())
     errs["small bins"] = tryerr(() -> write_report("selftest_bad", mktempdir(); bins_primary = small, ids))
     errs["ids in text"] = tryerr(() -> write_report("selftest_bad", mktempdir(); notes = ["see PDX $(first(ids))"], ids))
     errs["individual figure"] = tryerr(() -> write_report("selftest_bad", mktempdir(); figs = ["docs/fig_x_bands.png"], ids))
+    errs["absolute path"] = tryerr(() -> write_report("selftest_bad", mktempdir(); notes = ["fits in /Users/someone/fits"], ids))
+    @assert public_path(joinpath(ROOT, "fits")) == "fits" && public_path("/private/tmp/elsewhere/fits") == "fits" "public_path must be repo-relative"
     @assert all(b -> b.n_pdx >= M.PUBLIC_MIN_PDX, vcat(bins_new, bins_late, ev.resid_new, ev.resid_late)) "merged bins must aggregate >= $(M.PUBLIC_MIN_PDX) PDX"
     # new response section content
     @assert rm.insample !== nothing && rm.insample.n_pdx >= M.PUBLIC_MIN_PDX && rm.n_draws == 200 "in-sample response / draw count"

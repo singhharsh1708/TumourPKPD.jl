@@ -504,7 +504,8 @@ Rules for report outputs that may be published (the PDXE data are licensed and m
 redistributed): every bin (`n_pdx` field) and summary (`n_pdx` field) aggregates at least `min_pdx` distinct
 PDX models; the text contains none of the PDX model `ids` (as a whole token); and no individual-level figure
 (file names ending `_bands.png` or `_response.png`, which show individual curves / per-PDX categories) is among
-`figures`. Returns the violations (empty = fine).
+`figures`; and the text contains no absolute local path (`/Users/`, `/home/`, `/private/`). Returns the violations
+(empty = fine).
 """
 function public_output_violations(; bins = NamedTuple[], summaries = NamedTuple[], text::AbstractString = "",
                                   ids = String[], figures = String[], min_pdx::Integer = PUBLIC_MIN_PDX)
@@ -519,6 +520,9 @@ function public_output_violations(; bins = NamedTuple[], summaries = NamedTuple[
         isempty(id) && continue
         occursin(Regex("(?<![A-Za-z0-9])\\Q" * String(id) * "\\E(?![A-Za-z0-9])"), text) &&
             push!(v, "text contains the PDX id $(id)")
+    end
+    for pat in ("/Users/", "/home/", "/private/")
+        occursin(pat, text) && push!(v, "text contains an absolute local path ($(pat)...); use repo-relative paths")
     end
     for f in figures
         occursin(r"_(bands|response)\.png$", String(f)) &&
