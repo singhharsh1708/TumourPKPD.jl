@@ -619,6 +619,12 @@ end
     # individual-level figures
     v = TP.public_output_violations(figures = ["docs/fig_BKM120_bands.png", "docs/fig_BKM120_response.png", "docs/fig_BKM120_responsecal.png"])
     @test length(v) == 2
+    # absolute local paths
+    for pth in ("/Users/someone/repo/fits", "/home/runner/work/x", "/private/tmp/y")
+        v = TP.public_output_violations(text = "Fits: `$(pth)`")
+        @test length(v) == 1 && occursin("absolute local path", v[1])
+    end
+    @test isempty(TP.public_output_violations(text = "Fits: `fits/` (files `*_v2.jld2`), see docs/compare_X.md"))
     @test_throws ErrorException TP.assert_public_output(bins = [(arm = :treated, lo = 0.0, hi = 7.0, n_pdx = 2)])
     @test TP.assert_public_output(bins = ok_bins) === nothing
     @test TP.public_output_violations(summaries = [(n_pdx = 4,)], min_pdx = 3) == String[]
