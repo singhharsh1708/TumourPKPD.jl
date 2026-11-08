@@ -20,6 +20,7 @@ using ForwardDiff
 using JLD2
 using MCMCChains
 using Random, Statistics
+using LinearAlgebra: I
 using LogExpFunctions: logsumexp
 import Optim
 const DynamicPPL = Turing.DynamicPPL
@@ -1439,11 +1440,11 @@ function stage_target(units, doses, pk::OneCmt, cref::Real; start::NamedTuple, l
                       priors::HierPriors = default_priors(), latent_w0::Bool = true, reltol = 1e-5, abstol = 1e-5,
                       nu::Real = 5.0, baseline_sd::Real = 0.1, centered_lam0::Bool = true, k2_centered = nothing,
                       window_days::Real = 42, threaded::Bool = true, chunksize = 32, model_v2::Bool = false,
-                      waning::Bool = false)
+                      waning::Bool = false, model_fn = nothing)
     us = window_units(units, window_days)
     d = prepare_data(us, doses, pk, cref; lod, solver = SolverCfg(; reltol, abstol), latent_w0, threaded, nu,
                      baseline_sd, centered_lam0, k2_centered, model_v2, waning)
-    model = hier_model(d, priors)
+    model = model_fn === nothing ? hier_model(d, priors) : model_fn(d, priors)      # model_fn: experimental parameterisations (scripts/p6_*)
     vi = DynamicPPL.link(DynamicPPL.initialize_parameters!!(DynamicPPL.VarInfo(Random.MersenneTwister(0), model), start, model), model)
     dim = length(vi[:])
     ldf = DynamicPPL.LogDensityFunction(model, DynamicPPL.getlogjoint_internal, vi; adtype = AutoForwardDiff(; chunksize = min(dim, chunksize)))
@@ -1455,6 +1456,63 @@ function stage_target(units, doses, pk::OneCmt, cref::Real; start::NamedTuple, l
     ℓπ = x -> LogDensityProblems.logdensity(ldf, x)
     ∂ = x -> LogDensityProblems.logdensity_and_gradient(ldf, x)
     return (; d, model, ldf, layout, θ0, ℓπ, ∂ℓπ∂θ = ∂)
+end
+
+"Metric from a saved inverse mass: a vector is the diagonal metric, a matrix the dense one."
+_stage_metric(Minv::AbstractVector) = AHMC.DiagEuclideanMetric(copy(Minv))
+_stage_metric(Minv::AbstractMatrix) = AHMC.DenseEuclideanMetric(copy(Minv))
+
+# Dense metric estimated blockwise: only the covariance entries inside a group (and the diagonal) are kept, so the inverse mass is
+# block-diagonal (groups of coordinates dense, groups independent). Same Stan-style shrinkage as AdvancedHMC's WelfordCov.
+# `groups[j]` is the group id of coordinate j; coordinates with id 0 form one group (the population parameters).
+mutable struct MaskedCov{F<:AbstractFloat} <: AHMC.Adaptation.DenseMatrixEstimator{F}
+    n::Int
+    n_min::Int
+    μ::Vector{F}
+    M::Matrix{F}
+    δ::Vector{F}
+    cov::Matrix{F}
+    mask::BitMatrix
+end
+function MaskedCov(groups::AbstractVector{<:Integer}; n_min::Int = 10)
+    D = length(groups)
+    mask = BitMatrix([groups[i] == groups[j] for i in 1:D, j in 1:D])
+    return MaskedCov{Float64}(0, n_min, zeros(D), zeros(D, D), zeros(D), Matrix{Float64}(I, D, D), mask)
+end
+AHMC.Adaptation.resize_adaptor!(::MaskedCov, ::Tuple{Int}) = nothing
+function AHMC.Adaptation.reset!(wc::MaskedCov)
+    wc.n = 0; fill!(wc.μ, 0.0); fill!(wc.M, 0.0)
+    return nothing
+end
+function Base.push!(wc::MaskedCov, s::AbstractVector{<:AbstractFloat})
+    wc.n += 1
+    wc.δ .= s .- wc.μ
+    wc.μ .+= wc.δ ./ wc.n
+    wc.M .+= (s .- wc.μ) * wc.δ'
+    return nothing
+end
+function AHMC.Adaptation.get_estimation(wc::MaskedCov)
+    n = float(wc.n)
+    @assert n >= 2 "Cannot get covariance with only one sample"
+    return (n / ((n + 5) * (n - 1)) .* wc.M .+ (1e-3 * (5 / (n + 5))) .* Matrix{Float64}(I, size(wc.M)...)) .* wc.mask
+end
+
+"Group id per coordinate of the layout: 0 for population parameters, the unit index for per-unit coordinates (needs the k2 centring mask)."
+function stage_unit_groups(layout::StageLayout, k2_centered::AbstractVector{Bool})
+    cidx = findall(k2_centered); nidx = findall(.!k2_centered)
+    g = Int[]
+    for (k, n) in zip(layout.keys, layout.lens)
+        if n == 1 && !(k in (:llam0, :z_λ0, :lk2c, :z_k2, :z_Vtr, :llam1, :z_w0c, :z_w0t))
+            push!(g, 0)
+        elseif k === :lk2c
+            append!(g, cidx)
+        elseif k === :z_k2
+            append!(g, nidx)
+        else
+            append!(g, 1:n)
+        end
+    end
+    return g
 end
 
 _stat_row(st) = (float(st.n_steps), float(st.tree_depth), float(st.step_size), float(st.acceptance_rate),
@@ -1479,18 +1537,21 @@ continue with iterations `i+1:upto′`. `init_buffer`/`term_buffer`/`window_size
 function stage_warmup(tgt, θ0::AbstractVector, rng::AbstractRNG; nadapt::Integer = 500, δ::Real = 0.8, max_depth::Integer = 10,
                       Δ_max::Real = 1000.0, log_every::Integer = 25, logger = nothing, label::AbstractString = "",
                       resume = nothing, upto::Integer = nadapt, init_buffer::Integer = 75, term_buffer::Integer = 50,
-                      window_size::Integer = 25)
+                      window_size::Integer = 25, metric_kind::Symbol = :diag, groups = nothing)
     D = length(θ0)
     if resume === nothing
-        metric = AHMC.DiagEuclideanMetric(D)
+        metric = metric_kind in (:dense, :block) ? AHMC.DenseEuclideanMetric(D) : AHMC.DiagEuclideanMetric(D)
         h = AHMC.Hamiltonian(metric, tgt.ℓπ, tgt.∂ℓπ∂θ)
         ϵ0 = AHMC.find_good_stepsize(rng, h, θ0)
         integ = AHMC.Leapfrog(ϵ0)
-        adaptor = AHMC.StanHMCAdaptor(AHMC.MassMatrixAdaptor(metric), AHMC.StepSizeAdaptor(δ, integ); init_buffer, term_buffer, window_size)
+        pc = metric_kind === :nutpie ? AHMC.NutpieVar((D,)) :
+             metric_kind === :block ? MaskedCov(groups === nothing ? error("metric_kind = :block needs groups") : groups) :
+             AHMC.MassMatrixAdaptor(metric)
+        adaptor = AHMC.StanHMCAdaptor(pc, AHMC.StepSizeAdaptor(δ, integ); init_buffer, term_buffer, window_size)
         i0 = 0
         θstart = copy(θ0)
     else
-        metric = AHMC.DiagEuclideanMetric(copy(resume.Minv))
+        metric = _stage_metric(resume.Minv)
         h = AHMC.Hamiltonian(metric, tgt.ℓπ, tgt.∂ℓπ∂θ)
         integ = AHMC.Leapfrog(float(resume.ϵ))
         adaptor = resume.adaptor
@@ -1527,10 +1588,10 @@ end
 NUTS with the given FIXED step size and diagonal metric: `AHMC.adapt!` is never called, so nothing is adapted. `burnin`
 iterations are run and discarded first (no adaptation either). `θ` is ndraws × dim (unconstrained), `final` the last position.
 """
-function stage_sample(tgt, θ0::AbstractVector, ϵ::Real, Minv::AbstractVector, rng::AbstractRNG; ndraws::Integer = 250,
+function stage_sample(tgt, θ0::AbstractVector, ϵ::Real, Minv::AbstractVecOrMat, rng::AbstractRNG; ndraws::Integer = 250,
                       burnin::Integer = 0, max_depth::Integer = 10, Δ_max::Real = 1000.0, log_every::Integer = 25,
                       logger = nothing, label::AbstractString = "")
-    metric = AHMC.DiagEuclideanMetric(copy(Minv))
+    metric = _stage_metric(Minv)
     h = AHMC.Hamiltonian(metric, tgt.ℓπ, tgt.∂ℓπ∂θ)
     κ = AHMC.HMCKernel(AHMC.Trajectory{AHMC.MultinomialTS}(AHMC.Leapfrog(float(ϵ)), AHMC.GeneralisedNoUTurn(max_depth, Δ_max)))
     h, t = AHMC.sample_init(rng, h, copy(θ0))

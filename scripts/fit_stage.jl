@@ -159,11 +159,15 @@ end
 # warmup
 # ----------------------------------------------------------------------------------------------------------------------
 
+_diag(A::AbstractMatrix) = [A[i, i] for i in axes(A, 1)]
+_diag(v::AbstractVector) = v
+
 function do_warmup(drug, design, opts)
     dir = need(opts, "dir"); K = parse(Int, need(opts, "chain"))
     nadapt = parse(Int, getopt(opts, "nadapt", "500"))
     seglen = parse(Int, getopt(opts, "seglen", "0")); seg = parse(Int, getopt(opts, "seg", "1"))
     target = parse(Float64, getopt(opts, "target", "0.8")); maxdepth = parse(Int, getopt(opts, "maxdepth", "10"))
+    metric = getopt(opts, "metric", "diag"); metric in ("diag", "block") || error("--metric must be diag or block")
     init0 = JLD2.load(joinpath(dir, "init.jld2"))
     nm = length(init0["modes"]); mode = mod1(K, nm)
     ctx = load_context(dir, drug, design; start_mode = mode)
@@ -174,21 +178,24 @@ function do_warmup(drug, design, opts)
         prev = JLD2.load(joinpath(dir, "warmup_$(K)_$(seg - 1).jld2"))
         M.verify_fingerprint(ctx.fingerprint, get(prev, "fingerprint", nothing); what = "previous warmup segment warmup_$(K)_$(seg - 1).jld2")
         prev["mode"] == mode && prev["nadapt"] == nadapt && prev["seglen"] == seglen || error("previous warmup segment is inconsistent with the arguments")
+        get(prev, "metric", "diag") == metric || error("previous warmup segment used --metric=$(get(prev, "metric", "diag")), this one asked for $metric")
         prev["i"] < nadapt || error("warmup of chain $K is already complete")
     end
     rng = prev === nothing ? MersenneTwister(seed) : prev["rng"]
     i0 = prev === nothing ? 0 : prev["i"]
     upto = segmented ? min(nadapt, seg * seglen) : nadapt
     stamp("warmup chain $K" * (segmented ? " segment $seg (iterations $(i0 + 1)-$upto of $nadapt)" : "") *
-          ": start mode $mode of $nm (lp $(round(init0["modes"][mode].lp; digits = 1))), dim $(length(ctx.tgt.θ0)), seed $seed, $(Threads.nthreads()) threads")
+          ", metric $metric: start mode $mode of $nm (lp $(round(init0["modes"][mode].lp; digits = 1))), dim $(length(ctx.tgt.θ0)), seed $seed, $(Threads.nthreads()) threads")
     θ0 = M.unconstrain(ctx.tgt.layout, M.jitter_init(init0["modes"][mode].nt, MersenneTwister(seed), 0.02))
     resume = prev === nothing ? nothing : (; θ = prev["theta"], ϵ = prev["epsilon"], Minv = prev["Minv"], adaptor = prev["adaptor"], i = prev["i"])
+    groups = metric == "block" ? M.stage_unit_groups(ctx.tgt.layout, ctx.mask) : nothing
     w = M.stage_warmup(ctx.tgt, θ0, rng; nadapt, δ = target, max_depth = maxdepth, label = " $K", resume, upto,
+                       metric_kind = Symbol(metric), groups,
                        init_buffer = parse(Int, getopt(opts, "init-buffer", "75")), term_buffer = parse(Int, getopt(opts, "term-buffer", "50")),
                        window_size = parse(Int, getopt(opts, "window-size", "25")))
     stats = prev === nothing ? w.stats : vcat(prev["warm_stats"], w.stats)
     time_s = (prev === nothing ? 0.0 : prev["warm_time_s"]) + w.time
-    common = (; chain = K, mode, mode_lp = init0["modes"][mode].lp, seed, theta = w.θ, epsilon = w.ϵ, Minv = w.Minv, nadapt, target,
+    common = (; chain = K, mode, mode_lp = init0["modes"][mode].lp, seed, theta = w.θ, epsilon = w.ϵ, Minv = w.Minv, metric, nadapt, target,
               max_depth = maxdepth, warm_stats = stats, stat_names = collect(String.(M.STAT_NAMES)), warm_time_s = time_s,
               names = collect(String.(ctx.tgt.layout.names)), k2_centered = ctx.mask, models = ctx.models, threads = Threads.nthreads(),
               fingerprint = ctx.fingerprint)
@@ -199,7 +206,7 @@ function do_warmup(drug, design, opts)
     end
     st = stats
     stamp(@sprintf("warmup chain %d done in %.1f min (all segments): step size %.4f, mean n_steps %.1f (last 100: %.1f), divergences %d, metric range %.3g..%.3g",
-                   K, time_s / 60, w.ϵ, mean(st[:, 1]), mean(st[max(1, end-99):end, 1]), Int(sum(st[:, 5])), minimum(w.Minv), maximum(w.Minv)))
+                   K, time_s / 60, w.ϵ, mean(st[:, 1]), mean(st[max(1, end-99):end, 1]), Int(sum(st[:, 5])), minimum(_diag(w.Minv)), maximum(_diag(w.Minv))))
     jldsave(joinpath(dir, "warm_$(K).jld2"); common..., lp_final = ctx.tgt.ℓπ(w.θ))
     stamp("wrote $(joinpath(dir, "warm_$(K).jld2"))")
 end
@@ -219,7 +226,7 @@ function do_sample(drug, design, opts)
     collect(String.(ctx.tgt.layout.names)) == w["names"] || error("parameter layout differs from the warmup artifact")
     ctx.mask == w["k2_centered"] && ctx.models == w["models"] || error("k2 mask / model ids differ from the warmup artifact")
     seed = M.stage_seed(ctx.init["seed"], K, P)
-    stamp("sample chain $K part $P: $ndraws draws (+$burnin burn-in, no adaptation), step size $(round(w["epsilon"]; sigdigits = 4)), seed $seed, $(Threads.nthreads()) threads")
+    stamp("sample chain $K part $P: metric $(get(w, "metric", "diag")), $ndraws draws (+$burnin burn-in, no adaptation), step size $(round(w["epsilon"]; sigdigits = 4)), seed $seed, $(Threads.nthreads()) threads")
     # the warm state: same log density at the saved position as at the end of warmup
     lp = ctx.tgt.ℓπ(w["theta"])
     abs(lp - w["lp_final"]) <= 1e-8 * max(1.0, abs(lp)) || error("log density at the warm position differs from the warmup stage ($lp vs $(w["lp_final"]))")
@@ -296,6 +303,7 @@ function do_merge(drug, design, opts)
     dg["fit_window_day"] = float(init["window"])
     dg["stage"] = Dict{String,Any}("warmup_chains" => Ks, "parts" => sort(unique(p["part"] for p in parts)), "draws_per_part" => nd,
                                    "burnin" => first(parts)["burnin"], "nadapt" => first(values(warm))["nadapt"],
+                                   "metric" => join(sort(unique(get(w, "metric", "diag") for w in values(warm))), ","),
                                    "chain_labels" => labels, "warmup_chain_of_chain" => [p["chain"] for p in parts],
                                    "core_seconds" => wall_core,
                                    "warm_step_size" => Dict(K => warm[K]["epsilon"] for K in Ks),
@@ -337,6 +345,7 @@ function do_merge(drug, design, opts)
     println(md, "Staged fit (`scripts/fit_stage.jl`). No data in this file; parameters and sampler statistics only.\n")
     println(md, "- training PDX: $(length(ctx.models)) (window <= $(init["window"]) d); frozen split seed $(init["split_seed"]), holdout $(length(init["split"]["holdout_models"])) PDX")
     println(md, "- chains: $(length(parts)) = warmup chains K = $(join(Ks, ",")) x parts; $nd draws each ($(nd * length(parts)) draws), burn-in per part $(first(parts)["burnin"]), warmup $(first(values(warm))["nadapt"]) iterations")
+    println(md, "- sampler metric: $(dg["stage"]["metric"]) (diag = diagonal mass matrix; block = dense blocks for the population parameters and for each PDX's own coordinates)")
     println(md, "- model: **$(get(init, "model", "v1"))**$(get(init, "waning", false) ? " + waning efficacy" : "") (v2 = correlated log λ0/log k2 with LKJ(2), per-PDX transition volume); Student-t nu=$(init["nu"]) residuals, latent baselines (sd $(init["baseline_sd"])), LOD $(init["lod"]) mm^3, k2 centred for $(count(ctx.mask)) of $(length(ctx.mask)) units, centred lambda0")
     println(md, "- target fingerprint: `$(ctx.fingerprint)` (init id `$(init["init_id"])`); chains started from $(nstart_modes) distinct recorded mode(s)")
     println(md, "- mode gap limit: " * (isfinite(get(init, "mode_gap", Inf)) ? "$(init["mode_gap"]) log-density units (converged modes further below the best are not used as chain starts)" : "none (every converged distinct mode starts chains)"))
@@ -400,4 +409,4 @@ function main(args)
     return nothing
 end
 
-main(ARGS)
+abspath(PROGRAM_FILE) == (@__FILE__) && main(ARGS)      # includable by the p6 benchmark scripts

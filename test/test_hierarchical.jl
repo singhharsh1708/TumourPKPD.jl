@@ -1,4 +1,4 @@
-using Test, Random, Statistics, Distributions
+using Test, Random, Statistics, Distributions, LinearAlgebra
 using TumourPKPD
 using TumourPKPD: Dose, OneCmt, dosing_schedule, conc, PKExposure
 using Turing
@@ -327,6 +327,35 @@ using JLD2
         @test r3.ϵ == exp(r3.adaptor.ssa.state.x_bar)               # finalised once, at the last iteration
         @test r3.Minv != r1.Minv && all(r3.Minv .> 0) && all(isfinite, r3.θ)
         @test filesize(path) < 200_000                              # parameters only: no data/closures in the state
+
+        # block-dense metric: dense population block + dense per-unit blocks, groups independent
+        grp = H.stage_unit_groups(tgt.layout, mm.k2_centered)
+        @test length(grp) == length(tgt.θ0) && count(==(0), grp) == 7 && all(i -> count(==(i), grp) == 4, 1:length(units))
+        # estimator: one group = AdvancedHMC's WelfordCov; two groups = its estimate with the cross block removed
+        let D = 6, X = randn(MersenneTwister(7), 40, D) * [1.0 0.5 0 0 0 0; 0 1 0.3 0 0 0; 0 0 1 0 0 0; 0 0 0 1 0.8 0; 0 0 0 0 1 0; 0 0 0 0 0 2.0]
+            wc = H.AHMC.WelfordCov((D,)); mc1 = H.MaskedCov(zeros(Int, D)); mc2 = H.MaskedCov([0, 0, 0, 1, 1, 1])
+            for x in eachrow(X); push!(wc, collect(x)); push!(mc1, collect(x)); push!(mc2, collect(x)); end
+            full = H.AHMC.Adaptation.get_estimation(wc)
+            @test H.AHMC.Adaptation.get_estimation(mc1) ≈ full
+            E2 = H.AHMC.Adaptation.get_estimation(mc2)
+            @test E2[1:3, 4:6] == zeros(3, 3) && E2[1:3, 1:3] ≈ full[1:3, 1:3] && E2[4:6, 4:6] ≈ full[4:6, 4:6] && isposdef(Symmetric(E2))
+        end
+        gkw = (; kw..., metric_kind = :block, groups = grp)
+        rb0 = MersenneTwister(5)
+        b1 = H.stage_warmup(tgt, tgt.θ0, rb0; gkw..., upto = 90)
+        @test b1.Minv isa Matrix && size(b1.Minv) == (length(tgt.θ0), length(tgt.θ0)) && b1.Minv != Matrix(I, size(b1.Minv)...)
+        offblock = [grp[i] != grp[j] for i in eachindex(grp), j in eachindex(grp)]
+        @test all(iszero, b1.Minv[offblock]) && isposdef(Symmetric(b1.Minv)) && b1.Minv ≈ b1.Minv'
+        pathb = tempname() * ".jld2"
+        JLD2.jldsave(pathb; theta = b1.θ, epsilon = b1.ϵ, Minv = b1.Minv, adaptor = b1.adaptor, i = b1.i, rng = rb0)
+        fb = JLD2.load(pathb)
+        @test fb["adaptor"].pc isa H.MaskedCov && fb["adaptor"].pc.mask == b1.adaptor.pc.mask && fb["adaptor"].pc.M == b1.adaptor.pc.M
+        b2 = H.stage_warmup(tgt, fb["theta"], fb["rng"]; gkw..., resume = (; θ = fb["theta"], ϵ = fb["epsilon"], Minv = fb["Minv"], adaptor = fb["adaptor"], i = fb["i"]))
+        # (a resumed segment draws a fresh momentum, so the stream differs from a one-shot run: checked for validity, not identity)
+        @test b2.done && b2.i == nad && b2.ϵ > 0 && all(isfinite, b2.θ) && b2.ϵ == exp(b2.adaptor.ssa.state.x_bar)
+        @test b2.Minv isa Matrix && all(iszero, b2.Minv[offblock]) && isposdef(Symmetric(b2.Minv)) && b2.Minv != b1.Minv
+        sb = H.stage_sample(tgt2, b2.θ, b2.ϵ, b2.Minv, MersenneTwister(6); ndraws = 10, burnin = 2, log_every = 0)
+        @test all(sb.stats[:, 3] .== b2.ϵ) && size(sb.θ) == (10, length(tgt.θ0)) && all(isfinite, sb.θ)
 
         # fingerprint: sensitive to every part of the target, insensitive to nothing but identity
         mkfp(; kwargs...) = begin

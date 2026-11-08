@@ -57,6 +57,11 @@ on:
       waning:
         description: Pooled waning efficacy k2 exp(-rho t), true or false (sensitivity fit; saved with a _waning suffix)
         default: 'false'
+      metric:
+        description: Warmup mass matrix, diag (default) or block (dense population block + dense 5x5 block per PDX; about half the leapfrog steps)
+        type: choice
+        options: [diag, block]
+        default: diag
       warm_from_run:
         description: Resume mode, id of an earlier run (digits) whose init-* and warm-* artifacts are reused; init and warmup are skipped. model and waning must match that run
         default: ''
@@ -75,6 +80,9 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  METRIC: ${{ inputs.metric }}
 
 defaults:
   run:
@@ -413,11 +421,11 @@ jobs:
           DIR="stage/${DRUG}_${DESIGN}"
           if [ "$SEGMENTED" = "true" ]; then
             julia --project=. -t 4 scripts/fit_stage.jl warmup "$DRUG" "$DESIGN" \
-              --chain="$CHAIN" --dir="$DIR" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg=1
+              --chain="$CHAIN" --dir="$DIR" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg=1 --metric="$METRIC"
             echo "WARM_FILE=warmup_${CHAIN}_1.jld2" >> "$GITHUB_ENV"
           else
             julia --project=. -t 4 scripts/fit_stage.jl warmup "$DRUG" "$DESIGN" \
-              --chain="$CHAIN" --dir="$DIR" --nadapt="$NADAPT"
+              --chain="$CHAIN" --dir="$DIR" --nadapt="$NADAPT" --metric="$METRIC"
             echo "WARM_FILE=warm_${CHAIN}.jld2" >> "$GITHUB_ENV"
           fi
 
@@ -530,7 +538,7 @@ jobs:
       - name: Warmup segment 2
         run: |
           julia --project=. -t 4 scripts/fit_stage.jl warmup "$DRUG" "$DESIGN" \
-            --chain="$CHAIN" --dir="stage/${DRUG}_${DESIGN}" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg="$SEG"
+            --chain="$CHAIN" --dir="stage/${DRUG}_${DESIGN}" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg="$SEG" --metric="$METRIC"
           if [ "$SEG" = "$NSEG" ]; then
             echo "WARM_FILE=warm_${CHAIN}.jld2" >> "$GITHUB_ENV"
           else
@@ -646,7 +654,7 @@ jobs:
       - name: Warmup segment 3
         run: |
           julia --project=. -t 4 scripts/fit_stage.jl warmup "$DRUG" "$DESIGN" \
-            --chain="$CHAIN" --dir="stage/${DRUG}_${DESIGN}" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg="$SEG"
+            --chain="$CHAIN" --dir="stage/${DRUG}_${DESIGN}" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg="$SEG" --metric="$METRIC"
           if [ "$SEG" = "$NSEG" ]; then
             echo "WARM_FILE=warm_${CHAIN}.jld2" >> "$GITHUB_ENV"
           else
@@ -762,7 +770,7 @@ jobs:
       - name: Warmup segment 4
         run: |
           julia --project=. -t 4 scripts/fit_stage.jl warmup "$DRUG" "$DESIGN" \
-            --chain="$CHAIN" --dir="stage/${DRUG}_${DESIGN}" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg="$SEG"
+            --chain="$CHAIN" --dir="stage/${DRUG}_${DESIGN}" --nadapt="$NADAPT" --seglen="$SEGLEN" --seg="$SEG" --metric="$METRIC"
           if [ "$SEG" = "$NSEG" ]; then
             echo "WARM_FILE=warm_${CHAIN}.jld2" >> "$GITHUB_ENV"
           else
